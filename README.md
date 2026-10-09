@@ -9,6 +9,8 @@ screen and a FLIR Lepton 3.x thermal camera (160×120). This unit has a Lepton 3
   Open <http://m5-thermal.local/>, or its IP address from the boot log, for the web viewer:
   a display matching the LCD, tap-to-probe, palettes, manual range, °C/°F, mirror/rotate,
   fullscreen, and PNG/video/CSV capture.
+- The button on top freezes the frame (on the LCD and for web viewers); press again to
+  resume. Turning the thumbwheel shows the network status for a few seconds.
 - A long press of the power button turns the stick off, as with the stock firmware.
 
 ## Build and flash
@@ -50,7 +52,7 @@ firmware holds the bus for the second after the reset pulse.
 | Offset | Type | Field                                                     |
 |-------:|------|-----------------------------------------------------------|
 | 0      | u8   | version: 2 = raw pixels, 3 = delta-encoded pixels         |
-| 1      | u8   | flags: bit0 sensor ok, bit1 charging, bit2 USB power      |
+| 1      | u8   | flags: bit0 sensor ok, bit1 charging, bit2 USB power, bit3 frozen |
 | 2      | u8   | battery %                                                 |
 | 3      | u8   | reserved                                                  |
 | 4      | u16  | battery mV                                                |

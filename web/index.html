@@ -226,6 +226,7 @@
   let probe = null;          // { x, y } in frame coords (0..w, 0..h), or null
   let lastMsg = 0, frames = 0, fpsT = performance.now();
   let battery = null;        // { pct, charging, usb }
+  let frozen = false;        // The camera's freeze-frame button is on.
 
   // Apply mirror/rotation to the raw W x H grid.
   function orient(raw, W, H) {
@@ -361,6 +362,12 @@
   function drawPanel(L, st, Lut) {
     const x0 = L.panelX;
     drawBattery(x0 + PANEL_W - 18, 4);
+    if (frozen) {
+      // Pause icon below the battery, as on the device.
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(x0 + PANEL_W - 15, 13, 3, 8);
+      ctx.fillRect(x0 + PANEL_W - 9, 13, 3, 8);
+    }
     // Crosshair icon.
     ctx.strokeStyle = '#fff'; ctx.lineWidth = .9;
     ctx.beginPath();
@@ -522,6 +529,7 @@
       if (version !== 2 && version !== 3) return;
       const flags = dv.getUint8(1);
       const sensorOk = !!(flags & 1);
+      frozen = !!(flags & 8);
       setBattery(dv.getUint8(2), !!(flags & 2), !!(flags & 4));
       lastMsg = performance.now();
       const w = dv.getUint16(8, true), h = dv.getUint16(10, true);
@@ -546,7 +554,7 @@
 
   setInterval(() => {
     const now = performance.now();
-    $('fps').textContent = (frames * 1000 / (now - fpsT)).toFixed(1) + ' fps';
+    $('fps').textContent = frozen ? 'Paused' : (frames * 1000 / (now - fpsT)).toFixed(1) + ' fps';
     frames = 0; fpsT = now;
     if (ws && ws.readyState === 1 && now - lastMsg > 3000) setOverlay('No data from camera');
   }, 1000);

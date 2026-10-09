@@ -420,29 +420,43 @@ static void checkPowerButton() {
 }
 
 // Thumbwheel: an encoder at I2C 0x30 on the internal bus, read the way the
-// stock firmware does. Returns true if it was turned since the last call;
-// `ok` reports whether the encoder answered.
+// stock firmware does: register 0x10 is the push switch, 0x00 the signed
+// rotation since the last clear, and writing 0xFF to 0x20 clears it.
 constexpr uint8_t kEncoderAddr = 0x30;
 
-static bool encoderTurned(bool &ok) {
+struct EncoderState {
+  bool ok = false;       // The encoder answered.
+  bool turned = false;   // Rotated since the last read.
+  bool pressed = false;  // Push switch currently down.
+};
+
+static EncoderState readEncoder() {
+  EncoderState st;
   xSemaphoreTake(wire1Mutex, portMAX_DELAY);
-  bool turned = false;
   Wire1.beginTransmission(kEncoderAddr);
-  Wire1.write(0x00);  // Rotation since last clear, signed 16-bit.
-  ok = Wire1.endTransmission() == 0 && Wire1.requestFrom(kEncoderAddr, (uint8_t)2) == 2;
-  if (ok) {
-    int16_t steps = (Wire1.read() << 8) | Wire1.read();
-    if (steps != 0) {
-      turned = true;
-      Wire1.beginTransmission(kEncoderAddr);
-      Wire1.write(0x20);  // Clear the count.
-      Wire1.write(0xFF);
-      Wire1.endTransmission();
+  Wire1.write(0x10);
+  if (Wire1.endTransmission() == 0 && Wire1.requestFrom(kEncoderAddr, (uint8_t)1) == 1) {
+    st.pressed = Wire1.read() != 0;
+    Wire1.beginTransmission(kEncoderAddr);
+    Wire1.write(0x00);
+    if (Wire1.endTransmission() == 0 && Wire1.requestFrom(kEncoderAddr, (uint8_t)2) == 2) {
+      st.ok = true;
+      int16_t steps = (Wire1.read() << 8) | Wire1.read();
+      if (steps != 0) {
+        st.turned = true;
+        Wire1.beginTransmission(kEncoderAddr);
+        Wire1.write(0x20);
+        Wire1.write(0xFF);
+        Wire1.endTransmission();
+      }
     }
   }
   xSemaphoreGive(wire1Mutex);
-  return turned;
+  return st;
 }
+
+// Freeze frame: the display and web viewers keep showing the current frame.
+static bool frozen = false;
 
 // ---- Display --------------------------------------------------------------
 
@@ -585,6 +599,11 @@ struct FrameStats {
 // at a time into a small sprite.
 static void drawPanelContent(const FrameStats *st, int oy) {
   drawBatteryIcon(panel, kPanelW - 18, 4 - oy);
+  if (frozen) {
+    // Pause icon below the battery.
+    panel.fillRect(kPanelW - 15, 13 - oy, 3, 8, TFT_WHITE);
+    panel.fillRect(kPanelW - 9, 13 - oy, 3, 8, TFT_WHITE);
+  }
   drawCrosshairIcon(panel, 5, 8 - oy);
   if (!st) {
     panel.setTextColor(TFT_DARKGREY);
@@ -701,6 +720,7 @@ enum : uint8_t {
   kFlagSensorOk = 1 << 0,
   kFlagCharging = 1 << 1,
   kFlagUsbPower = 1 << 2,
+  kFlagFrozen = 1 << 3,
 };
 
 struct __attribute__((packed)) FrameHeader {
@@ -852,7 +872,7 @@ static void sendFrame(const uint16_t *pixels, uint32_t seq) {
     bytesSent += buf->size();
   }
   h.flags = (sensorOk ? kFlagSensorOk : 0) | (battery.charging ? kFlagCharging : 0) |
-            (battery.usb ? kFlagUsbPower : 0);
+            (battery.usb ? kFlagUsbPower : 0) | (frozen ? kFlagFrozen : 0);
   h.batteryPct = battery.pct;
   h.batteryMv = battery.mv;
   h.seq = seq;
@@ -964,6 +984,8 @@ void loop() {
   static uint32_t lastWebStatsMs = 0, lastEncoderMs = 0, statusShownMs = 0, lastStatusDrawMs = 0;
   static bool showingStatus = false;
   static uint8_t encoderFailures = 0;
+  static bool encoderWasPressed = false;
+  static uint32_t lastFrozenSendMs = 0, frozenSeq = 0;
   static bool shownNoSensor = true;
   uint32_t now = millis();
 
@@ -972,24 +994,49 @@ void loop() {
     checkPowerButton();
   }
 
-  // Thumbwheel: show the network status page. Poll less often if the
-  // encoder isn't answering, so it can't slow the shared I2C bus.
+  // Freeze button. Which input is the button on top isn't confirmed yet, so
+  // buttons A and B and the thumbwheel's push switch all toggle it, and the
+  // log says which one fired.
+  M5.update();
+  const char *freezeInput = M5.BtnA.wasPressed() ? "button A" : M5.BtnB.wasPressed() ? "button B" : nullptr;
+
+  // Thumbwheel: turning it shows the network status page. Poll less often if
+  // the encoder isn't answering, so it can't slow the shared I2C bus.
   if (now - lastEncoderMs >= (encoderFailures >= 3 ? 5000u : 100u)) {
     lastEncoderMs = now;
-    bool ok;
-    bool turned = encoderTurned(ok);
-    encoderFailures = ok ? 0 : min(encoderFailures + 1, 3);
-    if (turned) {
+    EncoderState enc = readEncoder();
+    encoderFailures = enc.ok ? 0 : min(encoderFailures + 1, 3);
+    if (enc.pressed && !encoderWasPressed && !freezeInput) freezeInput = "thumbwheel push";
+    encoderWasPressed = enc.pressed;
+    if (enc.turned) {
       if (!showingStatus) drawStatus(true);
       showingStatus = true;
       statusShownMs = lastStatusDrawMs = now;
     }
   }
+
+  if (freezeInput) {
+    Serial.printf("Freeze %s (%s)\n", frozen ? "off" : "on", freezeInput);
+    portENTER_CRITICAL(&frameMux);
+    // Holding readyBuf stops the sensor task replacing it; frames keep being
+    // captured in the background and are dropped until we let go.
+    frozen = readyInUse = !frozen;
+    frozenSeq = readySeq;
+    portEXIT_CRITICAL(&frameMux);
+    if (frozen && sensorOk) {
+      if (!showingStatus) drawFrame(readyBuf);  // Adds the pause icon.
+      sendFrame(readyBuf, frozenSeq);
+      lastFrozenSendMs = now;
+    }
+  }
+
   if (showingStatus) {
     if (now - statusShownMs >= kStatusShowMs) {
       showingStatus = false;
       M5.Lcd.fillScreen(TFT_BLACK);
-      if (!sensorOk) drawNoSensor();  // Otherwise the next frame redraws everything.
+      if (!sensorOk) drawNoSensor();
+      else if (frozen) drawFrame(readyBuf);
+      // Otherwise the next frame redraws everything.
     } else if (now - lastStatusDrawMs >= 500) {
       lastStatusDrawMs = now;
       drawStatus(false);
@@ -1010,13 +1057,19 @@ void loop() {
   uint32_t seq;
   portENTER_CRITICAL(&frameMux);
   seq = readySeq;
-  if (seq != lastSeq) {
+  if (!frozen && seq != lastSeq) {
     readyInUse = true;
     frame = readyBuf;
   }
   portEXIT_CRITICAL(&frameMux);
 
-  if (frame) {
+  if (frozen) {
+    // Keep viewers (including newly connected ones) showing the frozen frame.
+    if (sensorOk && now - lastFrozenSendMs >= 1000) {
+      lastFrozenSendMs = now;
+      sendFrame(readyBuf, frozenSeq);
+    }
+  } else if (frame) {
     lastSeq = seq;
     shownNoSensor = false;
     if (!showingStatus) drawFrame(frame);
