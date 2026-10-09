@@ -420,35 +420,29 @@ static void checkPowerButton() {
 }
 
 // Thumbwheel: an encoder at I2C 0x30 on the internal bus, read the way the
-// stock firmware does: register 0x10 is the push switch, 0x00 the signed
-// rotation since the last clear, and writing 0xFF to 0x20 clears it.
+// stock firmware does: register 0x00 is the signed rotation since the last
+// clear, and writing 0xFF to 0x20 clears it.
 constexpr uint8_t kEncoderAddr = 0x30;
 
 struct EncoderState {
-  bool ok = false;       // The encoder answered.
-  bool turned = false;   // Rotated since the last read.
-  bool pressed = false;  // Push switch currently down.
+  bool ok = false;      // The encoder answered.
+  bool turned = false;  // Rotated since the last read.
 };
 
 static EncoderState readEncoder() {
   EncoderState st;
   xSemaphoreTake(wire1Mutex, portMAX_DELAY);
   Wire1.beginTransmission(kEncoderAddr);
-  Wire1.write(0x10);
-  if (Wire1.endTransmission() == 0 && Wire1.requestFrom(kEncoderAddr, (uint8_t)1) == 1) {
-    st.pressed = Wire1.read() != 0;
-    Wire1.beginTransmission(kEncoderAddr);
-    Wire1.write(0x00);
-    if (Wire1.endTransmission() == 0 && Wire1.requestFrom(kEncoderAddr, (uint8_t)2) == 2) {
-      st.ok = true;
-      int16_t steps = (Wire1.read() << 8) | Wire1.read();
-      if (steps != 0) {
-        st.turned = true;
-        Wire1.beginTransmission(kEncoderAddr);
-        Wire1.write(0x20);
-        Wire1.write(0xFF);
-        Wire1.endTransmission();
-      }
+  Wire1.write(0x00);
+  if (Wire1.endTransmission() == 0 && Wire1.requestFrom(kEncoderAddr, (uint8_t)2) == 2) {
+    st.ok = true;
+    int16_t steps = (Wire1.read() << 8) | Wire1.read();
+    if (steps != 0) {
+      st.turned = true;
+      Wire1.beginTransmission(kEncoderAddr);
+      Wire1.write(0x20);
+      Wire1.write(0xFF);
+      Wire1.endTransmission();
     }
   }
   xSemaphoreGive(wire1Mutex);
@@ -713,6 +707,7 @@ extern const uint8_t indexHtmlEnd[] asm("_binary_web_index_html_end");
 
 static AsyncWebServer server(80);
 static volatile int wifiDisconnectReason = 0;  // Last reason since losing the connection.
+static volatile bool gotIp = false;  // Set by the Wi-Fi event; mDNS starts from loop().
 static AsyncWebSocket ws("/ws");
 
 // Wire format (little-endian), see README.
@@ -758,6 +753,7 @@ static void startNetwork() {
                     info.wifi_sta_connected.channel, WiFi.RSSI());
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
       wifiDisconnectReason = 0;
+      gotIp = true;
       Serial.printf("Wi-Fi: viewer at http://%s/ (or http://m5-thermal.local/)\n",
                     IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
     } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -777,7 +773,6 @@ static void startNetwork() {
   // makes the stream stutter.
   WiFi.setSleep(false);
   Serial.printf("Wi-Fi: joining \"%s\" (%s)\n", WIFI_SSID, isStatic ? "static " STATIC_IP : "DHCP");
-  if (MDNS.begin("m5-thermal")) MDNS.addService("http", "tcp", 80);
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
     // embed_txtfiles appends a NUL terminator; don't send it.
@@ -984,7 +979,6 @@ void loop() {
   static uint32_t lastWebStatsMs = 0, lastEncoderMs = 0, statusShownMs = 0, lastStatusDrawMs = 0;
   static bool showingStatus = false;
   static uint8_t encoderFailures = 0;
-  static bool encoderWasPressed = false;
   static uint32_t lastFrozenSendMs = 0, frozenSeq = 0;
   static bool shownNoSensor = true;
   uint32_t now = millis();
@@ -994,11 +988,20 @@ void loop() {
     checkPowerButton();
   }
 
-  // Freeze button. Which input is the button on top isn't confirmed yet, so
-  // buttons A and B and the thumbwheel's push switch all toggle it, and the
-  // log says which one fired.
+  // The button on top of the case is the StickC's button B: freeze frame.
+  // mDNS (m5-thermal.local) only announces reliably if started once we have
+  // an address.
+  static bool mdnsStarted = false;
+  if (gotIp && !mdnsStarted) {
+    mdnsStarted = true;
+    if (MDNS.begin("m5-thermal")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("mDNS: m5-thermal.local");
+    }
+  }
+
   M5.update();
-  const char *freezeInput = M5.BtnA.wasPressed() ? "button A" : M5.BtnB.wasPressed() ? "button B" : nullptr;
+  const bool freezePressed = M5.BtnB.wasPressed();
 
   // Thumbwheel: turning it shows the network status page. Poll less often if
   // the encoder isn't answering, so it can't slow the shared I2C bus.
@@ -1006,8 +1009,6 @@ void loop() {
     lastEncoderMs = now;
     EncoderState enc = readEncoder();
     encoderFailures = enc.ok ? 0 : min(encoderFailures + 1, 3);
-    if (enc.pressed && !encoderWasPressed && !freezeInput) freezeInput = "thumbwheel push";
-    encoderWasPressed = enc.pressed;
     if (enc.turned) {
       if (!showingStatus) drawStatus(true);
       showingStatus = true;
@@ -1015,8 +1016,8 @@ void loop() {
     }
   }
 
-  if (freezeInput) {
-    Serial.printf("Freeze %s (%s)\n", frozen ? "off" : "on", freezeInput);
+  if (freezePressed) {
+    Serial.printf("Freeze %s\n", frozen ? "off" : "on");
     portENTER_CRITICAL(&frameMux);
     // Holding readyBuf stops the sensor task replacing it; frames keep being
     // captured in the background and are dropped until we let go.
