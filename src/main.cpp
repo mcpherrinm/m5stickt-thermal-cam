@@ -6,6 +6,7 @@
 // macro that breaks <chrono>.
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <M5StickT.h>
 #include <SPI.h>
@@ -668,6 +669,10 @@ extern const uint8_t indexHtmlEnd[] asm("_binary_web_index_html_end");
 
 static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
+// Answers every DNS lookup with our address. Phones check for internet access
+// when they join; without DNS that check fails and they switch back to a
+// network that has internet (usually the one at home).
+static DNSServer dns;
 
 // Wire format (little-endian), see README.
 enum : uint8_t {
@@ -690,16 +695,51 @@ struct __attribute__((packed)) FrameHeader {
 };
 
 static void startNetwork() {
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+    if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+      const uint8_t *m = info.wifi_ap_staconnected.mac;
+      Serial.printf("Wi-Fi: %02x:%02x:%02x joined (aid %d)\n", m[3], m[4], m[5], info.wifi_ap_staconnected.aid);
+    } else if (event == ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED) {
+      Serial.printf("Wi-Fi: assigned %s\n", IPAddress(info.wifi_ap_staipassigned.ip.addr).toString().c_str());
+    } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+      const uint8_t *m = info.wifi_ap_stadisconnected.mac;
+      Serial.printf("Wi-Fi: %02x:%02x:%02x left (aid %d)\n", m[3], m[4], m[5], info.wifi_ap_stadisconnected.aid);
+    }
+  });
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD, 6, 0, 4);
+  Serial.printf("Wi-Fi: channel %d, TX power %d (0.25 dBm units)\n", WiFi.channel(), (int)WiFi.getTxPower());
   Serial.printf("AP \"%s\" up at http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
   if (MDNS.begin("m5-thermal")) MDNS.addService("http", "tcp", 80);
+  dns.setErrorReplyCode(DNSReplyCode::NoError);
+  dns.start(53, "*", WiFi.softAPIP());
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
+    Serial.printf("HTTP: page requested by %s\n", req->client()->remoteIP().toString().c_str());
     // embed_txtfiles appends a NUL terminator; don't send it.
     req->send(200, "text/html", indexHtmlStart, indexHtmlEnd - indexHtmlStart - 1);
   });
-  server.onNotFound([](AsyncWebServerRequest *req) { req->redirect("/"); });
+  // Connectivity checks: answer as if the internet were reachable, so phones
+  // stay on this network instead of treating it as broken.
+  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *req) {  // Apple
+    req->send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+  });
+  server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *req) { req->send(204); });  // Android
+  server.on("/gen_204", HTTP_GET, [](AsyncWebServerRequest *req) { req->send(204); });
+  server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *req) {  // Windows
+    req->send(200, "text/plain", "Microsoft Connect Test");
+  });
+  server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *req) { req->send(200, "text/plain", "Microsoft NCSI"); });
+  // Unknown paths on our own address go to the viewer; other sites' background
+  // requests (all resolved to us) get a cheap 404 rather than the page.
+  server.onNotFound([](AsyncWebServerRequest *req) {
+    const String &host = req->host();
+    if (host == WiFi.softAPIP().toString() || host.startsWith("m5-thermal")) {
+      req->redirect("/");
+    } else {
+      req->send(404);
+    }
+  });
   ws.onEvent([](AsyncWebSocket *, AsyncWebSocketClient *client, AwsEventType type, void *,
                 uint8_t *, size_t) {
     if (type == WS_EVT_CONNECT) client->setCloseClientOnQueueFull(true);
@@ -840,6 +880,8 @@ void loop() {
   static bool shownNoSensor = true;
   uint32_t now = millis();
 
+  dns.processNextRequest();
+
   if (now - lastButtonMs >= 100) {
     lastButtonMs = now;
     checkPowerButton();
@@ -887,9 +929,9 @@ void loop() {
   if (now - lastWebStatsMs >= 10000) {
     lastWebStatsMs = now;
     if (ws.count()) {
-      Serial.printf("Web: %u viewers, %u frames sent (avg %u B), %u skipped; heap %u free, %u largest\n",
+      Serial.printf("Web: %u viewers, %u frames sent (avg %u B), %u skipped; heap %u free, %u largest, %u lowest\n",
                     ws.count(), framesSent, framesSent ? bytesSent / framesSent : 0, framesSkipped,
-                    ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+                    ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
     }
     framesSent = framesSkipped = bytesSent = 0;
   }
