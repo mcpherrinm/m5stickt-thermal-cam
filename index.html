@@ -21,6 +21,7 @@
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; background: var(--bg); color: var(--text); }
   body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 20px 16px 40px; }
   main { max-width: 1000px; margin: 0 auto; }
@@ -68,6 +69,17 @@
     font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word;
   }
   .empty { color: var(--muted); text-align: center; padding: 28px 16px; }
+  .snap { margin-top: 14px; }
+  .progress { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+  .progress .bar { flex: 1; height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+  .progress .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .snap-body { display: grid; grid-template-columns: minmax(0, 1fr) 200px; gap: 14px; align-items: start; margin-top: 10px; }
+  @media (max-width: 640px) { .snap-body { grid-template-columns: minmax(0, 1fr); } }
+  .snap canvas { width: 100%; height: auto; display: block; border-radius: 8px; background: #000; }
+  .scale { height: 8px; border-radius: 4px; margin-top: 8px; }
+  .scale-labels { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .snap-side dl { grid-template-columns: 1fr 1fr; margin: 0 0 12px; }
+  .snap-side .actions { flex-direction: column; align-items: stretch; }
 </style>
 </head>
 <body>
@@ -111,11 +123,35 @@
     </dl>
     <div class="actions">
       <a class="btn" data-a="open" target="_blank" rel="noopener" aria-disabled="true">Open viewer</a>
+      <button class="btn" data-a="snap" disabled>Take snapshot</button>
       <button class="btn" data-a="logs">Show logs</button>
       <button class="btn" data-a="conn">Disconnect</button>
       <button class="btn" data-a="forget">Forget</button>
     </div>
     <p class="hint" data-f="hint" hidden></p>
+    <div class="snap" hidden>
+      <div class="progress" hidden><div class="bar"><span></span></div><span data-f="snapmsg"></span></div>
+      <div class="snap-body" hidden>
+        <div>
+          <canvas width="640" height="480"></canvas>
+          <canvas class="scale" width="256" height="1"></canvas>
+          <div class="scale-labels"><span data-f="smin"></span><span data-f="smax"></span></div>
+        </div>
+        <div class="snap-side">
+          <dl>
+            <div><dt>Taken</dt><dd data-f="stime">–</dd></div>
+            <div><dt>Centre</dt><dd data-f="sctr">–</dd></div>
+            <div><dt>Max</dt><dd data-f="shot">–</dd></div>
+            <div><dt>Min</dt><dd data-f="scold">–</dd></div>
+          </dl>
+          <div class="actions">
+            <button class="btn" data-a="png">Download PNG</button>
+            <button class="btn" data-a="csv">Download CSV</button>
+          </div>
+          <p class="hint" data-f="snote" hidden></p>
+        </div>
+      </div>
+    </div>
     <div class="viewer" hidden><iframe title="Camera viewer" allow="fullscreen"></iframe></div>
     <div class="logs" hidden>
       <div class="logs-bar">
@@ -137,6 +173,52 @@
   const BAUD = 115200, MAX_LOG_LINES = 5000, STATUS_EVERY_MS = 5000;
   // Browsers block a plain-HTTP iframe inside an HTTPS page (mixed content).
   const canEmbed = location.protocol === 'http:';
+
+  const SNAPSHOT_TIMEOUT_MS = 10000, SNAPSHOT_RETRIES = 2;
+
+  // "Ironbow" palette, as on the device and in its viewer.
+  const IRONBOW = [[0, 0, 0, 10], [.15, 45, 0, 120], [.32, 140, 0, 150], [.5, 215, 40, 70],
+                   [.65, 245, 110, 0], [.82, 255, 190, 0], [1, 255, 255, 230]];
+  const LUT = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const p = i / 255;
+    let s = 0;
+    while (s < IRONBOW.length - 2 && p > IRONBOW[s + 1][0]) s++;
+    const a = IRONBOW[s], b = IRONBOW[s + 1], f = (p - a[0]) / (b[0] - a[0]);
+    for (let c = 0; c < 3; c++) LUT[i * 3 + c] = a[c + 1] + (b[c + 1] - a[c + 1]) * f;
+  }
+
+  const CRC_TABLE = new Uint32Array(256).map((_, n) => {
+    for (let k = 0; k < 8; k++) n = n & 1 ? 0xEDB88320 ^ (n >>> 1) : n >>> 1;
+    return n >>> 0;
+  });
+  function crc32(bytes) {
+    let c = 0xFFFFFFFF;
+    for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  // Frame message (as on the camera's WebSocket, see README) -> temperatures.
+  function decodeFrame(bytes) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const version = dv.getUint8(0), flags = dv.getUint8(1);
+    const w = dv.getUint16(8, true), h = dv.getUint16(10, true);
+    const scale = dv.getFloat32(12, true), offset = dv.getFloat32(16, true);
+    if ((version !== 2 && version !== 3) || !w || !h) throw new Error('unexpected frame format');
+    const raw = new Uint16Array(w * h);
+    let p = 20;
+    for (let i = 0; i < w * h; i++) {
+      if (version === 2) { raw[i] = dv.getUint16(p, true); p += 2; continue; }
+      let z = bytes[p++];
+      if (z & 0x80) z = ((z & 0x7F) << 8) | bytes[p++];
+      raw[i] = (i % w ? raw[i - 1] : i ? raw[i - w] : 0) + ((z >>> 1) ^ -(z & 1));
+    }
+    if (p !== bytes.length) throw new Error('frame size mismatch');
+    const t = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) t[i] = raw[i] * scale + offset;
+    return { w, h, t, frozen: !!(flags & 8), radiometric: Math.abs(offset + 273.15) < .01 };
+  }
+  const fmtC = c => `${c.toFixed(1)} °C`;
 
   const $ = id => document.getElementById(id);
   const hex = n => n == null ? '?' : n.toString(16).padStart(4, '0');
@@ -160,6 +242,9 @@
       const info = port.getInfo();
       this.q('.port').textContent = `USB ${hex(info.usbVendorId)}:${hex(info.usbProductId)}`;
       this.a('logs').onclick = () => this.toggleLogs();
+      this.a('snap').onclick = () => this.takeSnapshot();
+      this.a('png').onclick = () => this.snapshot && this.snapCanvas().toBlob(b => b && saveBlob(b, `thermal-${this.snapshot.stamp}.png`), 'image/png');
+      this.a('csv').onclick = () => this.downloadCsv();
       this.a('conn').onclick = () => this.open ? this.disconnect() : this.connect();
       this.a('forget').onclick = () => this.forget();
       this.a('clear').onclick = () => { this.lines = []; this.q('pre.log').textContent = ''; this.updateCount(); };
@@ -190,10 +275,11 @@
       }
       this.open = true;
       this.a('conn').textContent = 'Disconnect';
-      // Release DTR and RTS: on ESP32 boards these drive reset and boot mode.
-      try { await this.port.setSignals({ dataTerminalReady: false, requestToSend: false }); } catch {}
+      this.a('snap').disabled = false;
+      // Leave DTR and RTS as opened. On ESP32 boards they drive reset and boot
+      // mode, and changing them (one at a time) passes through "reset".
       this.setState('Waiting for camera…', 'warn');
-      this.readLoop();
+      this.reading = this.readLoop();
       this.requestStatus();
       this.timer = setInterval(() => this.requestStatus(), STATUS_EVERY_MS);
     }
@@ -226,8 +312,122 @@
         if (line.startsWith('@status ')) {
           try { this.onStatus(JSON.parse(line.slice(8))); continue; } catch {}
         }
+        if (line.startsWith('@frame ')) { this.onFrameLine(line); continue; }
+        if (line.startsWith('@frame-error ')) {
+          this.addLog(`[page] camera: ${line.slice(13)}`);
+          this.snapshotFailed(line.slice(13), false);
+          continue;
+        }
         this.addLog(line);
       }
+      if (this.snapPending && this.partial.startsWith('@frame ')) this.snapProgress();
+    }
+
+    // ---- Snapshots: "snapshot" -> "@frame <bytes> <crc32> <base64>" ----
+    takeSnapshot(retry = 0) {
+      if (!this.open || (this.snapPending && !retry)) return;
+      this.snapPending = true;
+      this.snapRetry = retry;
+      this.q('.snap').hidden = false;
+      this.q('.progress').hidden = false;
+      this.q('.progress .bar span').style.width = '0';
+      this.f('snapmsg').textContent = retry ? `Corrupted in transfer; retrying (${retry}/${SNAPSHOT_RETRIES})…` : 'Requesting…';
+      this.a('snap').disabled = true;
+      clearTimeout(this.snapTimer);
+      this.snapTimer = setTimeout(() => this.snapshotFailed('no reply from the camera', false), SNAPSHOT_TIMEOUT_MS);
+      this.addLog(`[page] snapshot requested${retry ? ` (retry ${retry})` : ''}`);
+      this.send('snapshot\n');
+    }
+    snapProgress() {
+      const m = /^@frame (\d+) [0-9a-f]+ /.exec(this.partial);
+      if (!m) return;
+      const total = Math.ceil(+m[1] / 3) * 4, got = this.partial.length - m[0].length;
+      this.q('.progress .bar span').style.width = `${Math.min(100, got / total * 100)}%`;
+      this.f('snapmsg').textContent = `Receiving ${Math.round(got / total * 100)}%`;
+      clearTimeout(this.snapTimer);  // Data is flowing; restart the timeout.
+      this.snapTimer = setTimeout(() => this.snapshotFailed('transfer stalled', true), SNAPSHOT_TIMEOUT_MS);
+    }
+    onFrameLine(line) {
+      this.addLog(`[page] snapshot received (${line.length} chars)`);
+      if (!this.snapPending) return;
+      const [, size, crc, data] = line.split(' ');
+      let bytes;
+      try {
+        bytes = Uint8Array.from(atob(data), c => c.charCodeAt(0));
+        if (bytes.length !== +size || crc32(bytes) !== parseInt(crc, 16)) throw new Error('crc');
+      } catch {
+        return this.snapshotFailed('corrupted in transfer', true);  // Usually a log line landed inside it.
+      }
+      let frame;
+      try { frame = decodeFrame(bytes); } catch (e) { return this.snapshotFailed(e.message, false); }
+      clearTimeout(this.snapTimer);
+      this.snapPending = false;
+      this.a('snap').disabled = !this.open;
+      this.q('.progress').hidden = true;
+      this.showSnapshot(frame);
+    }
+    snapshotFailed(reason, retryable) {
+      if (!this.snapPending) return;
+      clearTimeout(this.snapTimer);
+      if (retryable && this.snapRetry < SNAPSHOT_RETRIES) return this.takeSnapshot(this.snapRetry + 1);
+      this.snapPending = false;
+      this.a('snap').disabled = !this.open;
+      this.q('.progress .bar span').style.width = '0';
+      this.f('snapmsg').textContent = `Snapshot failed: ${reason}.`;
+    }
+
+    showSnapshot(f) {
+      const now = new Date();
+      let minI = 0, maxI = 0;
+      for (let i = 1; i < f.t.length; i++) { if (f.t[i] < f.t[minI]) minI = i; if (f.t[i] > f.t[maxI]) maxI = i; }
+      const lo = f.t[minI], hi = Math.max(f.t[maxI], lo + .1);
+      const cx = f.w / 2, cy = f.h / 2;
+      const centre = (f.t[(cy - 1) * f.w + cx - 1] + f.t[(cy - 1) * f.w + cx] + f.t[cy * f.w + cx - 1] + f.t[cy * f.w + cx]) / 4;
+      this.snapshot = { ...f, minI, maxI, lo, hi, centre, taken: now,
+                        stamp: now.toISOString().replace(/[:.]/g, '-').slice(0, 19) };
+
+      // Image at 4x, smoothed, with the device's crosshair and markers.
+      const img = new ImageData(f.w, f.h);
+      for (let i = 0; i < f.t.length; i++) {
+        const c = Math.max(0, Math.min(255, ((f.t[i] - lo) / (hi - lo) * 255) | 0)) * 3;
+        img.data.set([LUT[c], LUT[c + 1], LUT[c + 2], 255], i * 4);
+      }
+      const src = document.createElement('canvas');
+      src.width = f.w; src.height = f.h;
+      src.getContext('2d').putImageData(img, 0, 0);
+      const k = 4, cv = this.snapCanvas(), ctx = cv.getContext('2d');
+      cv.width = f.w * k; cv.height = f.h * k;
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(src, 0, 0, cv.width, cv.height);
+      const at = i => [(i % f.w + .5) * k, ((i / f.w | 0) + .5) * k];
+      marker(ctx, ...at(maxI), true, '#ff4d3d');
+      marker(ctx, ...at(minI), false, '#4da3ff');
+      crosshair(ctx, cv.width / 2, cv.height / 2);
+
+      const sc = this.q('canvas.scale').getContext('2d'), bar = new ImageData(256, 1);
+      for (let i = 0; i < 256; i++) bar.data.set([LUT[i * 3], LUT[i * 3 + 1], LUT[i * 3 + 2], 255], i * 4);
+      sc.putImageData(bar, 0, 0);
+      this.f('smin').textContent = fmtC(lo);
+      this.f('smax').textContent = fmtC(hi);
+      this.f('stime').textContent = now.toLocaleTimeString([], { hour12: false });
+      this.f('sctr').textContent = fmtC(centre);
+      this.f('shot').textContent = fmtC(f.t[maxI]);
+      this.f('scold').textContent = fmtC(f.t[minI]);
+      const notes = [];
+      if (f.frozen) notes.push('This is the frozen frame.');
+      if (!f.radiometric) notes.push("This Lepton isn't radiometric, so temperatures are estimates.");
+      this.f('snote').textContent = notes.join(' ');
+      this.f('snote').hidden = !notes.length;
+      this.q('.snap-body').hidden = false;
+    }
+    snapCanvas() { return this.q('.snap-body canvas'); }
+    downloadCsv() {
+      const f = this.snapshot;
+      if (!f) return;
+      const rows = [];
+      for (let y = 0; y < f.h; y++) rows.push(Array.from(f.t.slice(y * f.w, (y + 1) * f.w), v => v.toFixed(2)).join(','));
+      saveBlob(new Blob([`# °C, ${f.w}x${f.h}, ${f.taken.toISOString()}\n${rows.join('\n')}\n`], { type: 'text/csv' }),
+               `thermal-${f.stamp}.csv`);
     }
 
     onStatus(st) {
@@ -262,10 +462,16 @@
       }
     }
 
-    async requestStatus() {
-      if (!this.open || !this.port.writable) return;
-      const writer = this.port.writable.getWriter();
-      try { await writer.write(new TextEncoder().encode('status\n')); } catch {} finally { writer.releaseLock(); }
+    requestStatus() { this.send('status\n'); }
+
+    // Writes are queued so concurrent commands don't fight over the writer.
+    send(text) {
+      this.writing = (this.writing || Promise.resolve()).then(async () => {
+        if (!this.open || !this.port.writable) return;
+        const writer = this.port.writable.getWriter();
+        try { await writer.write(new TextEncoder().encode(text)); } catch {} finally { writer.releaseLock(); }
+      });
+      return this.writing;
     }
 
     addLog(line) {
@@ -296,25 +502,25 @@
     }
 
     download() {
-      const blob = new Blob([this.lines.join('\n') + '\n'], { type: 'text/plain' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `m5-thermal-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      saveBlob(new Blob([this.lines.join('\n') + '\n'], { type: 'text/plain' }),
+               `m5-thermal-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`);
     }
 
     async disconnect() {
       this.open = false;
       clearInterval(this.timer);
       try { if (this.reader) await this.reader.cancel(); } catch {}
-      try { await this.port.close(); } catch {}
+      // The port can only close once the read loop has released its stream.
+      try { await this.reading; } catch {}
+      try { await this.port.close(); } catch (e) { console.warn('close failed', e); }
       this.closed('Disconnected');
     }
 
     closed(text) {
       this.open = false;
       clearInterval(this.timer);
+      this.a('snap').disabled = true;
+      if (this.snapPending) this.snapshotFailed('disconnected', false);
       this.setState(text);
       this.a('conn').textContent = 'Connect';
     }
@@ -330,6 +536,30 @@
       this.el.remove();
       cameras.delete(this.port);
       updateEmpty();
+    }
+  }
+
+  function saveBlob(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+  function marker(ctx, x, y, up, color) {
+    ctx.beginPath();
+    if (up) { ctx.moveTo(x, y - 12); ctx.lineTo(x + 11, y + 8); ctx.lineTo(x - 11, y + 8); }
+    else { ctx.moveTo(x, y + 12); ctx.lineTo(x + 11, y - 8); ctx.lineTo(x - 11, y - 8); }
+    ctx.closePath();
+    ctx.lineWidth = 4; ctx.strokeStyle = '#000'; ctx.stroke();
+    ctx.fillStyle = color; ctx.fill();
+  }
+  function crosshair(ctx, x, y) {
+    for (const [w, c] of [[6, 'rgba(0,0,0,.8)'], [3, '#fff']]) {
+      ctx.lineWidth = w; ctx.strokeStyle = c; ctx.beginPath();
+      ctx.moveTo(x - 26, y); ctx.lineTo(x - 9, y); ctx.moveTo(x + 9, y); ctx.lineTo(x + 26, y);
+      ctx.moveTo(x, y - 26); ctx.lineTo(x, y - 9); ctx.moveTo(x, y + 9); ctx.lineTo(x, y + 26);
+      ctx.stroke();
     }
   }
 

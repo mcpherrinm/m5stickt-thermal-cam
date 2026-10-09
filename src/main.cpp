@@ -9,6 +9,7 @@
 #include <ESPAsyncWebServer.h>
 #include <M5StickT.h>
 #include <SPI.h>
+#include <esp32/rom/crc.h>
 
 static_assert(sizeof(WIFI_SSID) > 1, "Set wifi_ssid in secrets.ini");
 static_assert(sizeof(WIFI_SSID) - 1 <= 32, "wifi_ssid must be at most 32 characters");
@@ -59,6 +60,8 @@ static bool readyInUse = false;
 static volatile float tempScale = 0;
 static volatile float tempOffset = 0;
 static volatile bool sensorOk = false;
+// A snapshot line is being written to serial; routine log lines wait.
+static volatile bool serialBusy = false;
 
 // ---- Lepton CCI (I2C command interface) -----------------------------------
 
@@ -336,7 +339,7 @@ static void sensorTask(void *) {
     }
     vsyncTimeouts = 0;
 
-    if (millis() - statsMs >= 10000) {
+    if (millis() - statsMs >= 10000 && !serialBusy) {
       Serial.printf("Lepton: %.1f fps, %u bad segments, %u resyncs\n",
                     frames * 1000.0f / (millis() - statsMs), badSegments, resyncs);
       statsMs = millis();
@@ -708,7 +711,7 @@ extern const uint8_t indexHtmlEnd[] asm("_binary_web_index_html_end");
 static AsyncWebServer server(80);
 static volatile int wifiDisconnectReason = 0;  // Last reason since losing the connection.
 static volatile bool gotIp = false;  // Set by the Wi-Fi event; mDNS starts from loop().
-static volatile bool wifiChanged = false;  // Report the new state over serial.
+static volatile bool wifiChanged = false;  // Print a status line over serial.
 static AsyncWebSocket ws("/ws");
 
 // Wire format (little-endian), see README.
@@ -823,6 +826,40 @@ static size_t encodeFrame(const uint16_t *px, uint8_t *out) {
 }
 static uint32_t framesSent = 0, framesSkipped = 0, bytesSent = 0;
 static uint32_t frameMsgBusySince = 0;
+// A serial snapshot borrows frameMsg (holding a reference) while it's sent.
+static AsyncWebSocketSharedBuffer snapMsg;
+static bool snapRequested = false;  // A snapshot is waiting for frameMsg...
+static uint32_t snapRequestedMs = 0;  // ...since this time.
+
+// Header for a frame message (version 2; callers set 3 once delta-encoded).
+static FrameHeader makeHeader(bool hasPixels, uint32_t seq) {
+  FrameHeader h = {};
+  h.version = 2;
+  h.flags = (sensorOk ? kFlagSensorOk : 0) | (battery.charging ? kFlagCharging : 0) |
+            (battery.usb ? kFlagUsbPower : 0) | (frozen ? kFlagFrozen : 0);
+  h.batteryPct = battery.pct;
+  h.batteryMv = battery.mv;
+  h.seq = seq;
+  h.width = hasPixels ? kFrameW : 0;
+  h.height = hasPixels ? kFrameH : 0;
+  h.scale = tempScale;
+  h.offset = tempOffset;
+  return h;
+}
+
+// Header plus pixels, delta-encoded if possible (else raw); returns the size.
+static size_t buildFrameMessage(const uint16_t *pixels, uint32_t seq, uint8_t *out) {
+  FrameHeader h = makeHeader(true, seq);
+  size_t payload = encodeFrame(pixels, out + sizeof(h));
+  if (payload) {
+    h.version = 3;
+  } else {
+    memcpy(out + sizeof(h), pixels, kFramePixels * 2);
+    payload = kFramePixels * 2;
+  }
+  memcpy(out, &h, sizeof(h));
+  return sizeof(h) + payload;
+}
 
 static void sendFrame(const uint16_t *pixels, uint32_t seq) {
   if (ws.count() == 0) return;
@@ -831,6 +868,11 @@ static void sendFrame(const uint16_t *pixels, uint32_t seq) {
   if (pixels) {
     // Still referenced by a viewer's send queue: that viewer is behind, so
     // skip this frame rather than overwrite the one being sent.
+    // Lent to (or being drained for) a serial snapshot; viewers resume after.
+    if (snapMsg || snapRequested) {
+      framesSkipped++;
+      return;
+    }
     if (frameMsg.use_count() > 1) {
       framesSkipped++;
       // A viewer that stops reading (e.g. a backgrounded browser tab) never
@@ -854,32 +896,15 @@ static void sendFrame(const uint16_t *pixels, uint32_t seq) {
     buf = std::make_shared<std::vector<uint8_t>>(sizeof(FrameHeader));
   }
 
-  FrameHeader h = {};
-  h.version = 2;
-  size_t payload = 0;
+  FrameHeader h = makeHeader(pixels != nullptr, seq);
   if (pixels) {
     buf->resize(kFrameMsgCapacity);  // Within capacity: never reallocates.
-    payload = encodeFrame(pixels, buf->data() + sizeof(h));
-    if (payload) {
-      h.version = 3;
-    } else {
-      memcpy(buf->data() + sizeof(h), pixels, kFramePixels * 2);
-      payload = kFramePixels * 2;
-    }
-    buf->resize(sizeof(h) + payload);
+    buf->resize(buildFrameMessage(pixels, seq, buf->data()));
     framesSent++;
     bytesSent += buf->size();
+  } else {
+    memcpy(buf->data(), &h, sizeof(h));
   }
-  h.flags = (sensorOk ? kFlagSensorOk : 0) | (battery.charging ? kFlagCharging : 0) |
-            (battery.usb ? kFlagUsbPower : 0) | (frozen ? kFlagFrozen : 0);
-  h.batteryPct = battery.pct;
-  h.batteryMv = battery.mv;
-  h.seq = seq;
-  h.width = pixels ? kFrameW : 0;
-  h.height = pixels ? kFrameH : 0;
-  h.scale = tempScale;
-  h.offset = tempOffset;
-  memcpy(buf->data(), &h, sizeof(h));
   // Viewers still sending the previous message skip this one.
   ws.binaryAll(buf);
 }
@@ -973,6 +998,84 @@ static void printStatusLine() {
                 frozen ? "true" : "false", sensorOk ? "true" : "false", battery.pct);
 }
 
+// Single frame over serial ("snapshot"): one line, "@frame <bytes> <crc32>
+// <base64>", carrying the same message as the WebSocket stream. It's ~26 KB
+// of text, ~2-3 s at 115200 baud, so it's streamed from loop() in pieces.
+// There isn't memory for its own 38 KB buffer, so it borrows frameMsg
+// (pausing web viewers meanwhile). Other log lines can still land inside it
+// occasionally; the CRC lets the receiver detect that.
+static size_t snapLen = 0, snapPos = 0;
+
+static void requestSnapshot() {
+  if (snapMsg || snapRequested) return;  // One at a time.
+  if (!sensorOk) {
+    Serial.println("@frame-error no image yet");
+    return;
+  }
+  // The Lepton's first frames after a reset are unsettled (wild values).
+  if (readySeq < 20) {
+    Serial.println("@frame-error camera warming up");
+    return;
+  }
+  snapRequested = true;
+  snapRequestedMs = millis();
+}
+
+static void startSnapshotIfReady() {
+  if (!snapRequested) return;
+  if (frameMsg.use_count() > 1) {  // A viewer's frame is still being sent.
+    if (millis() - snapRequestedMs > 3000) {
+      snapRequested = false;
+      Serial.println("@frame-error busy");
+    }
+    return;
+  }
+  snapRequested = false;
+  snapMsg = frameMsg;
+  // The frame on screen: readyBuf. Hold it (as when frozen) while encoding.
+  portENTER_CRITICAL(&frameMux);
+  bool wasHeld = readyInUse;
+  readyInUse = true;
+  uint32_t seq = readySeq;
+  portEXIT_CRITICAL(&frameMux);
+  snapMsg->resize(kFrameMsgCapacity);
+  snapLen = buildFrameMessage(readyBuf, seq, snapMsg->data());
+  if (!wasHeld) {
+    portENTER_CRITICAL(&frameMux);
+    readyInUse = false;
+    portEXIT_CRITICAL(&frameMux);
+  }
+  snapPos = 0;
+  serialBusy = true;
+  Serial.printf("@frame %u %08x ", (unsigned)snapLen, (unsigned)crc32_le(0, snapMsg->data(), snapLen));
+}
+
+static void continueSnapshot() {
+  static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  char out[256];
+  while (snapMsg && Serial.availableForWrite() >= (int)sizeof(out)) {
+    const uint8_t *src = snapMsg->data();
+    size_t n = 0;
+    while (n + 4 <= sizeof(out) && snapPos < snapLen) {
+      uint32_t v = src[snapPos] << 16;
+      size_t k = min((size_t)3, snapLen - snapPos);
+      if (k > 1) v |= src[snapPos + 1] << 8;
+      if (k > 2) v |= src[snapPos + 2];
+      out[n++] = b64[(v >> 18) & 63];
+      out[n++] = b64[(v >> 12) & 63];
+      out[n++] = k > 1 ? b64[(v >> 6) & 63] : '=';
+      out[n++] = k > 2 ? b64[v & 63] : '=';
+      snapPos += k;
+    }
+    Serial.write((const uint8_t *)out, n);
+    if (snapPos >= snapLen) {
+      Serial.write('\n');
+      snapMsg.reset();
+      serialBusy = false;
+    }
+  }
+}
+
 static void pollSerial() {
   static char line[32];
   static uint8_t len = 0;
@@ -980,21 +1083,28 @@ static void pollSerial() {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       line[len] = 0;
-      if (!strcmp(line, "status")) printStatusLine();
+      // Status lines wait until a snapshot line is finished.
+      if (!strcmp(line, "status")) wifiChanged = true;
+      else if (!strcmp(line, "snapshot")) requestSnapshot();
       len = 0;
     } else if (len < sizeof(line) - 1) {
       line[len++] = c;
     }
   }
-  if (wifiChanged) {
+  startSnapshotIfReady();
+  if (wifiChanged && !snapMsg) {  // Not in the middle of a snapshot line.
     wifiChanged = false;
     printStatusLine();
   }
+  continueSnapshot();
 }
 
 // ---- Main -----------------------------------------------------------------
 
 void setup() {
+  // A transmit buffer lets snapshots stream without blocking loop(); it must
+  // be set before M5.begin() starts the port.
+  Serial.setTxBufferSize(4096);
   M5.begin();
   wire1Mutex = xSemaphoreCreateMutex();
   captureBuf = (uint16_t *)calloc(kFramePixels, sizeof(uint16_t));
@@ -1142,7 +1252,7 @@ void loop() {
     sendFrame(nullptr, seq);
   }
 
-  if (now - lastWebStatsMs >= 10000) {
+  if (now - lastWebStatsMs >= 10000 && !serialBusy) {
     lastWebStatsMs = now;
     if (ws.count()) {
       Serial.printf("Web: %u viewers, %u frames sent (avg %u B), %u skipped; heap %u free, %u largest, %u lowest\n",

@@ -26,12 +26,20 @@ cp secrets.ini.example secrets.ini      # set wifi_ssid, wifi_password (and stat
 
 `index.html` (at the repo root, for GitHub Pages) uses WebSerial to find cameras plugged
 into the computer. It reads each camera's network status (network, IP, signal, viewers),
-shows its live log, and links to its viewer. Browsers block embedding the camera's plain
-HTTP page in an HTTPS page, so from GitHub Pages the viewer opens in a new tab; served over
-HTTP (e.g. `python3 -m http.server`, then <http://localhost:8000/>) it's embedded too.
+shows its live log, takes single snapshots over USB (no Wi-Fi needed; about 2.5 s each,
+downloadable as PNG or CSV), and links to the camera's viewer. Browsers block embedding the
+camera's plain HTTP page in an HTTPS page, so from GitHub Pages the viewer opens in a new
+tab; served over HTTP (e.g. `python3 -m http.server`, then <http://localhost:8000/>) it's
+embedded too. The page leaves the serial control lines alone, so connecting doesn't restart
+the camera.
 
-Opening the serial port restarts the camera. The firmware answers `status` on the serial
-port with one `@status {json}` line, and prints one whenever its Wi-Fi connection changes.
+Serial commands (115200 baud, newline-terminated):
+
+- `status` → one `@status {json}` line (also printed whenever the Wi-Fi connection changes).
+- `snapshot` → one `@frame <bytes> <crc32 hex> <base64>` line carrying a frame message in the
+  WebSocket format below, or `@frame-error <reason>`. It shows what's on screen (the frozen
+  frame, if frozen). Web viewers pause while it's sent. Other log output can occasionally
+  land inside the line; check the CRC and retry.
 
 ## Layout
 
