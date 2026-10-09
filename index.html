@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0e0f12">
+<title>M5 Thermal Cameras</title>
+<style>
+  :root {
+    --bg: #0e0f12;
+    --panel: #17191e;
+    --panel-2: #1f2229;
+    --line: #2a2e37;
+    --text: #e8e9ec;
+    --muted: #8b909c;
+    --accent: #ff8a1f;
+    --hot: #ff4d3d;
+    --ok: #3ecf6e;
+    --warn: #f0b429;
+    --radius: 12px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 20px 16px 40px; }
+  main { max-width: 1000px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .sub { color: var(--muted); margin: 2px 0 0; font-size: 13px; }
+  .btn {
+    appearance: none; border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+    border-radius: 8px; padding: 7px 12px; font: inherit; cursor: pointer; min-height: 36px; text-decoration: none;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .btn:hover:not(:disabled) { border-color: #3a404c; }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.primary { border-color: var(--accent); color: var(--accent); }
+  .notice { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; color: var(--muted); }
+  .notice strong { color: var(--text); }
+  #cameras { display: grid; gap: 14px; }
+  #error { margin: 0 0 14px; color: var(--text); border-color: var(--hot); }
+  .card { background: var(--panel); border-radius: var(--radius); padding: 14px 16px; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .card-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
+  .card-title h2 { font-size: 15px; margin: 0; font-weight: 600; }
+  .port { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .chip.ok::before { background: var(--ok); }
+  .chip.warn::before { background: var(--warn); }
+  .chip.bad::before { background: var(--hot); }
+  dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 16px; margin: 14px 0 12px; }
+  dt { color: var(--muted); font-size: 12px; }
+  dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; word-break: break-all; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+  /* Tall enough for the viewer's 16:9 display plus its header and buttons. */
+  .viewer { margin-top: 14px; border-radius: 10px; overflow: hidden; background: #000;
+            height: clamp(420px, calc(min(968px, 100vw - 64px) * .5625 + 180px), 760px); }
+  .viewer iframe { width: 100%; height: 100%; border: 0; display: block; }
+  .logs { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .logs-bar { display: flex; align-items: center; gap: 10px; padding: 6px 8px; background: var(--panel-2); font-size: 12px; color: var(--muted); }
+  .logs-bar .spacer { flex: 1; }
+  .logs-bar .btn { min-height: 28px; padding: 3px 9px; font-size: 12px; }
+  .logs-bar label { display: inline-flex; align-items: center; gap: 5px; }
+  pre.log {
+    margin: 0; height: 320px; overflow: auto; padding: 8px 10px; background: #0a0b0d;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word;
+  }
+  .empty { color: var(--muted); text-align: center; padding: 28px 16px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>M5 Thermal Cameras</h1>
+      <p class="sub">Cameras connected to this computer over USB</p>
+    </div>
+    <button class="btn primary" id="add">Add camera…</button>
+  </header>
+
+  <div class="notice" id="unsupported" hidden>
+    <strong>This browser doesn't support WebSerial.</strong>
+    It's needed to talk to cameras over USB. Try a desktop browser with WebSerial support.
+  </div>
+
+  <p class="notice" id="error" hidden></p>
+
+  <div id="cameras">
+    <div class="notice empty" id="none">
+      No cameras yet. Plug one in over USB and choose <strong>Add camera…</strong>.
+      Cameras you've added before reconnect automatically.
+    </div>
+  </div>
+</main>
+
+<template id="card">
+  <section class="card">
+    <div class="card-head">
+      <div class="card-title"><h2>USB serial device</h2><span class="port"></span></div>
+      <span class="chip">Connecting…</span>
+    </div>
+    <dl>
+      <div><dt>Network</dt><dd data-f="ssid">–</dd></div>
+      <div><dt>IP address</dt><dd data-f="ip">–</dd></div>
+      <div><dt>Signal</dt><dd data-f="rssi">–</dd></div>
+      <div><dt>Viewers</dt><dd data-f="viewers">–</dd></div>
+      <div><dt>Battery</dt><dd data-f="battery">–</dd></div>
+      <div><dt>Frame</dt><dd data-f="frozen">–</dd></div>
+    </dl>
+    <div class="actions">
+      <a class="btn" data-a="open" target="_blank" rel="noopener" aria-disabled="true">Open viewer</a>
+      <button class="btn" data-a="logs">Show logs</button>
+      <button class="btn" data-a="conn">Disconnect</button>
+      <button class="btn" data-a="forget">Forget</button>
+    </div>
+    <p class="hint" data-f="hint" hidden></p>
+    <div class="viewer" hidden><iframe title="Camera viewer" allow="fullscreen"></iframe></div>
+    <div class="logs" hidden>
+      <div class="logs-bar">
+        <span data-f="logcount">0 lines</span>
+        <span class="spacer"></span>
+        <label><input type="checkbox" data-a="follow" checked> Follow</label>
+        <button class="btn" data-a="clear">Clear</button>
+        <button class="btn" data-a="save">Download</button>
+      </div>
+      <pre class="log"></pre>
+    </div>
+  </section>
+</template>
+
+<script>
+(() => {
+  // USB-serial bridges used by M5Stack devices (the M5StickC's is FTDI).
+  const FILTERS = [{ usbVendorId: 0x0403 }, { usbVendorId: 0x1a86 }, { usbVendorId: 0x10c4 }, { usbVendorId: 0x303a }];
+  const BAUD = 115200, MAX_LOG_LINES = 5000, STATUS_EVERY_MS = 5000;
+  // Browsers block a plain-HTTP iframe inside an HTTPS page (mixed content).
+  const canEmbed = location.protocol === 'http:';
+
+  const $ = id => document.getElementById(id);
+  const hex = n => n == null ? '?' : n.toString(16).padStart(4, '0');
+  const cameras = new Map();  // SerialPort -> Camera
+
+  if (!('serial' in navigator)) {
+    $('unsupported').hidden = false;
+    $('add').disabled = true;
+    $('none').hidden = true;
+    return;
+  }
+
+  class Camera {
+    constructor(port) {
+      this.port = port;
+      this.lines = [];
+      this.partial = '';
+      this.status = null;
+      this.open = false;
+      this.el = $('card').content.firstElementChild.cloneNode(true);
+      const info = port.getInfo();
+      this.q('.port').textContent = `USB ${hex(info.usbVendorId)}:${hex(info.usbProductId)}`;
+      this.a('logs').onclick = () => this.toggleLogs();
+      this.a('conn').onclick = () => this.open ? this.disconnect() : this.connect();
+      this.a('forget').onclick = () => this.forget();
+      this.a('clear').onclick = () => { this.lines = []; this.q('pre.log').textContent = ''; this.updateCount(); };
+      this.a('save').onclick = () => this.download();
+      $('cameras').appendChild(this.el);
+    }
+    q(sel) { return this.el.querySelector(sel); }
+    a(name) { return this.el.querySelector(`[data-a="${name}"]`); }
+    f(name) { return this.el.querySelector(`[data-f="${name}"]`); }
+
+    setState(text, kind) {
+      const chip = this.q('.chip');
+      chip.textContent = text;
+      chip.className = 'chip' + (kind ? ' ' + kind : '');
+    }
+    hint(text) { const h = this.f('hint'); h.textContent = text || ''; h.hidden = !text; }
+
+    async connect() {
+      this.setState('Connecting…');
+      this.hint('');
+      try {
+        await this.port.open({ baudRate: BAUD });
+      } catch (e) {
+        this.setState('Port busy', 'bad');
+        this.hint(`Couldn't open the port (${e.message}). Is another program, such as a serial monitor, using it?`);
+        this.a('conn').textContent = 'Connect';
+        return;
+      }
+      this.open = true;
+      this.a('conn').textContent = 'Disconnect';
+      // Release DTR and RTS: on ESP32 boards these drive reset and boot mode.
+      try { await this.port.setSignals({ dataTerminalReady: false, requestToSend: false }); } catch {}
+      this.setState('Waiting for camera…', 'warn');
+      this.readLoop();
+      this.requestStatus();
+      this.timer = setInterval(() => this.requestStatus(), STATUS_EVERY_MS);
+    }
+
+    async readLoop() {
+      const decoder = new TextDecoder();
+      while (this.open && this.port.readable) {
+        this.reader = this.port.readable.getReader();
+        try {
+          for (;;) {
+            const { value, done } = await this.reader.read();
+            if (done) break;
+            this.onText(decoder.decode(value, { stream: true }));
+          }
+        } catch (e) {
+          // Framing/parity errors are recoverable; a lost device isn't.
+          if (e.name === 'NetworkError' || !this.port.readable) break;
+        } finally {
+          this.reader.releaseLock();
+          this.reader = null;
+        }
+      }
+      if (this.open) this.closed('Disconnected');
+    }
+
+    onText(text) {
+      const parts = (this.partial + text).split(/\r?\n/);
+      this.partial = parts.pop();
+      for (const line of parts) {
+        if (line.startsWith('@status ')) {
+          try { this.onStatus(JSON.parse(line.slice(8))); continue; } catch {}
+        }
+        this.addLog(line);
+      }
+    }
+
+    onStatus(st) {
+      this.status = st;
+      this.q('h2').textContent = 'M5 Thermal';
+      if (!st.connected) this.setState(`Not on Wi-Fi: ${st.reason || 'disconnected'}`, 'warn');
+      else this.setState('Online', 'ok');
+      this.f('ssid').textContent = st.ssid || '–';
+      this.f('ip').textContent = st.ip || 'none';
+      this.f('rssi').textContent = st.connected ? `${st.rssi} dBm` : '–';
+      this.f('viewers').textContent = st.viewers;
+      this.f('battery').textContent = `${st.battery}%`;
+      this.f('frozen').textContent = !st.sensor ? 'No sensor' : st.frozen ? 'Frozen' : 'Live';
+
+      const open = this.a('open'), url = st.ip ? `http://${st.ip}/` : null;
+      if (url) { open.href = url; open.removeAttribute('aria-disabled'); }
+      else { open.removeAttribute('href'); open.setAttribute('aria-disabled', 'true'); }
+      open.style.opacity = url ? '' : '.45';
+      open.style.pointerEvents = url ? '' : 'none';
+
+      const viewer = this.q('.viewer'), frame = this.q('iframe');
+      if (canEmbed && url) {
+        if (frame.getAttribute('src') !== url) frame.src = url;
+        viewer.hidden = false;
+      } else {
+        viewer.hidden = true;
+        if (frame.getAttribute('src')) frame.removeAttribute('src');
+      }
+      if (url && !canEmbed && !this.hintShown) {
+        this.hintShown = true;
+        this.hint('The viewer opens in a new tab: browsers block embedding the camera\'s HTTP page in this HTTPS page.');
+      }
+    }
+
+    async requestStatus() {
+      if (!this.open || !this.port.writable) return;
+      const writer = this.port.writable.getWriter();
+      try { await writer.write(new TextEncoder().encode('status\n')); } catch {} finally { writer.releaseLock(); }
+    }
+
+    addLog(line) {
+      const stamp = new Date().toLocaleTimeString([], { hour12: false });
+      const entry = `${stamp}  ${line}`;
+      this.lines.push(entry);
+      const pre = this.q('pre.log');
+      if (this.lines.length > MAX_LOG_LINES) {
+        this.lines.splice(0, this.lines.length - MAX_LOG_LINES);
+        if (!this.q('.logs').hidden) pre.textContent = this.lines.join('\n') + '\n';
+      } else if (!this.q('.logs').hidden) {
+        pre.append(entry + '\n');
+      }
+      if (!this.q('.logs').hidden && this.a('follow').checked) pre.scrollTop = pre.scrollHeight;
+      this.updateCount();
+    }
+    updateCount() { this.f('logcount').textContent = `${this.lines.length} line${this.lines.length === 1 ? '' : 's'}`; }
+
+    toggleLogs() {
+      const logs = this.q('.logs'), show = logs.hidden;
+      logs.hidden = !show;
+      this.a('logs').textContent = show ? 'Hide logs' : 'Show logs';
+      if (show) {
+        const pre = this.q('pre.log');
+        pre.textContent = this.lines.length ? this.lines.join('\n') + '\n' : '';
+        pre.scrollTop = pre.scrollHeight;
+      }
+    }
+
+    download() {
+      const blob = new Blob([this.lines.join('\n') + '\n'], { type: 'text/plain' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `m5-thermal-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+
+    async disconnect() {
+      this.open = false;
+      clearInterval(this.timer);
+      try { if (this.reader) await this.reader.cancel(); } catch {}
+      try { await this.port.close(); } catch {}
+      this.closed('Disconnected');
+    }
+
+    closed(text) {
+      this.open = false;
+      clearInterval(this.timer);
+      this.setState(text);
+      this.a('conn').textContent = 'Connect';
+    }
+
+    async forget() {
+      await this.disconnect();
+      try { await this.port.forget(); } catch {}
+      this.remove();
+    }
+
+    remove() {
+      clearInterval(this.timer);
+      this.el.remove();
+      cameras.delete(this.port);
+      updateEmpty();
+    }
+  }
+
+  function updateEmpty() { $('none').hidden = cameras.size > 0; }
+
+  function addPort(port) {
+    if (cameras.has(port)) return cameras.get(port);
+    const cam = new Camera(port);
+    cameras.set(port, cam);
+    updateEmpty();
+    cam.connect();
+    return cam;
+  }
+
+  $('add').onclick = async () => {
+    $('error').hidden = true;
+    try { addPort(await navigator.serial.requestPort({ filters: FILTERS })); }
+    catch (e) {
+      if (e.name === 'NotFoundError') return;  // Chooser cancelled.
+      $('error').textContent = `Couldn't add a camera: ${e.message}`;
+      $('error').hidden = false;
+    }
+  };
+
+  // Previously allowed cameras: connect to any that are plugged in, now and later.
+  navigator.serial.getPorts().then(ports => ports.forEach(addPort));
+  navigator.serial.addEventListener('connect', e => addPort(e.target));
+  navigator.serial.addEventListener('disconnect', e => {
+    const cam = cameras.get(e.target);
+    if (cam) { cam.closed('Unplugged'); cam.remove(); }
+  });
+})();
+</script>
+</body>
+</html>

@@ -22,11 +22,23 @@ cp secrets.ini.example secrets.ini      # set wifi_ssid, wifi_password (and stat
 .venv/bin/pio device monitor            # boot log with the IP address, then stats every 10 s
 ```
 
+## Finding cameras over USB
+
+`index.html` (at the repo root, for GitHub Pages) uses WebSerial to find cameras plugged
+into the computer. It reads each camera's network status (network, IP, signal, viewers),
+shows its live log, and links to its viewer. Browsers block embedding the camera's plain
+HTTP page in an HTTPS page, so from GitHub Pages the viewer opens in a new tab; served over
+HTTP (e.g. `python3 -m http.server`, then <http://localhost:8000/>) it's embedded too.
+
+Opening the serial port restarts the camera. The firmware answers `status` on the serial
+port with one `@status {json}` line, and prints one whenever its Wi-Fi connection changes.
+
 ## Layout
 
 - `src/main.cpp`: Lepton capture task (CCI over I²C, VoSPI over SPI), LCD, battery,
   Wi-Fi and WebSocket stream
 - `web/index.html`: viewer page, embedded into the firmware at build time
+- `index.html`: WebSerial page for finding cameras and reading their logs
 
 Kept locally and not committed (see `.gitignore`):
 

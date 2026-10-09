@@ -708,6 +708,7 @@ extern const uint8_t indexHtmlEnd[] asm("_binary_web_index_html_end");
 static AsyncWebServer server(80);
 static volatile int wifiDisconnectReason = 0;  // Last reason since losing the connection.
 static volatile bool gotIp = false;  // Set by the Wi-Fi event; mDNS starts from loop().
+static volatile bool wifiChanged = false;  // Report the new state over serial.
 static AsyncWebSocket ws("/ws");
 
 // Wire format (little-endian), see README.
@@ -754,11 +755,14 @@ static void startNetwork() {
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
       wifiDisconnectReason = 0;
       gotIp = true;
+      wifiChanged = true;
       Serial.printf("Wi-Fi: viewer at http://%s/ (or http://m5-thermal.local/)\n",
                     IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
     } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
       // Reason codes: wifi_err_reason_t, e.g. 15 = handshake timeout (wrong
       // password), 201 = network not found. The driver retries by itself.
+      // The driver retries every few seconds; only report a new reason.
+      if (wifiDisconnectReason != info.wifi_sta_disconnected.reason) wifiChanged = true;
       wifiDisconnectReason = info.wifi_sta_disconnected.reason;
       Serial.printf("Wi-Fi: disconnected (reason %d)\n", info.wifi_sta_disconnected.reason);
     }
@@ -941,6 +945,53 @@ static void drawStatus(bool full) {
   lcd.setTextPadding(0);
 }
 
+// ---- Serial console --------------------------------------------------------
+
+// Machine-readable status for the WebSerial page (index.html at the repo
+// root): one "@status {json}" line, printed when "status" is received and
+// whenever the Wi-Fi connection changes.
+static void printJson(const char *s) {
+  Serial.print('"');
+  for (; *s; s++) {
+    if (*s == '"' || *s == '\\') Serial.print('\\');
+    if ((uint8_t)*s >= 0x20) Serial.print(*s);
+  }
+  Serial.print('"');
+}
+
+static void printStatusLine() {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  Serial.print("@status {\"device\":\"m5-thermal\",\"ssid\":");
+  printJson(WIFI_SSID);
+  Serial.printf(",\"connected\":%s,\"ip\":", connected ? "true" : "false");
+  if (connected) printJson(WiFi.localIP().toString().c_str());
+  else Serial.print("null");
+  Serial.printf(",\"rssi\":%d,\"reason\":", connected ? WiFi.RSSI() : 0);
+  if (connected) Serial.print("null");
+  else printJson(disconnectText(wifiDisconnectReason));
+  Serial.printf(",\"viewers\":%u,\"frozen\":%s,\"sensor\":%s,\"battery\":%u}\n", (unsigned)ws.count(),
+                frozen ? "true" : "false", sensorOk ? "true" : "false", battery.pct);
+}
+
+static void pollSerial() {
+  static char line[32];
+  static uint8_t len = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      line[len] = 0;
+      if (!strcmp(line, "status")) printStatusLine();
+      len = 0;
+    } else if (len < sizeof(line) - 1) {
+      line[len++] = c;
+    }
+  }
+  if (wifiChanged) {
+    wifiChanged = false;
+    printStatusLine();
+  }
+}
+
 // ---- Main -----------------------------------------------------------------
 
 void setup() {
@@ -989,6 +1040,8 @@ void loop() {
   }
 
   // The button on top of the case is the StickC's button B: freeze frame.
+  pollSerial();
+
   // mDNS (m5-thermal.local) only announces reliably if started once we have
   // an address.
   static bool mdnsStarted = false;
