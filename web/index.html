@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0f12">
+<title>M5 Thermal</title>
+<style>
+  :root {
+    --bg: #0e0f12;
+    --panel: #17191e;
+    --panel-2: #1f2229;
+    --line: #2a2e37;
+    --text: #e8e9ec;
+    --muted: #8b909c;
+    --accent: #ff8a1f;
+    --hot: #ff4d3d;
+    --cold: #4da3ff;
+    --ok: #3ecf6e;
+    --warn: #f0b429;
+    --radius: 12px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    padding: max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+             max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    max-width: 1200px; margin: 0 auto 12px;
+  }
+  h1 { font-size: 16px; white-space: nowrap; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  .status { display: flex; align-items: center; gap: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
+  .dot.live { background: var(--ok); }
+  .dot.bad { background: var(--hot); }
+  .batt { display: inline-flex; align-items: center; gap: 6px; }
+  .batt svg { display: block; }
+
+  .layout { display: grid; gap: 16px; max-width: 1200px; margin: 0 auto; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr) 300px; align-items: start; } }
+
+  .stage { background: #000; border-radius: var(--radius); overflow: hidden; position: relative; }
+  canvas#view { display: block; width: 100%; height: auto; touch-action: none; cursor: crosshair; }
+  .overlay {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.6); color: var(--text); font-size: 15px; text-align: center; padding: 16px;
+  }
+  .overlay.show { display: flex; }
+  .legend { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: center;
+    padding: 10px 12px; background: var(--panel); font-variant-numeric: tabular-nums; color: var(--muted); }
+  canvas#bar { width: 100%; height: 10px; border-radius: 5px; display: block; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 12px; }
+  .stat { background: var(--panel); border-radius: 10px; padding: 8px 10px; min-width: 0; }
+  .stat .k { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .stat .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .sw { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+
+  aside { background: var(--panel); border-radius: var(--radius); padding: 14px; display: grid; gap: 16px; }
+  .group > .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .06em; }
+  .seg { display: flex; flex-wrap: wrap; gap: 6px; }
+  .seg button, .btn {
+    appearance: none; border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font: inherit; cursor: pointer; min-height: 34px;
+  }
+  .seg button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  .btn:hover, .seg button:hover { border-color: #3a404c; }
+  .btn.rec { border-color: var(--hot); color: var(--hot); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input[type=number] {
+    width: 100%; min-width: 0; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 8px; font: inherit;
+  }
+  .row input:disabled { opacity: .45; }
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .fine { color: var(--muted); font-size: 12px; }
+  @media (max-width: 520px) {
+    #fps { display: none; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .stat .v { font-size: 18px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>M5 Thermal</h1>
+  <div class="status">
+    <span id="conn"><span class="dot" id="connDot"></span><span id="connText">Connecting…</span></span>
+    <span id="fps">– fps</span>
+    <span class="batt" id="batt" title="Battery"></span>
+  </div>
+</header>
+
+<div class="layout">
+  <section>
+    <div class="stage">
+      <canvas id="view" width="640" height="480"></canvas>
+      <div class="overlay show" id="overlay">Connecting to camera…</div>
+      <div class="legend">
+        <span id="legendMin">–</span>
+        <canvas id="bar" width="256" height="1"></canvas>
+        <span id="legendMax">–</span>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k"><span class="sw" style="background:var(--hot)"></span>Max</div><div class="v" id="sMax">–</div></div>
+      <div class="stat"><div class="k"><span class="sw" style="background:var(--cold)"></span>Min</div><div class="v" id="sMin">–</div></div>
+      <div class="stat"><div class="k"><span class="sw" style="background:#fff"></span>Centre</div><div class="v" id="sCtr">–</div></div>
+      <div class="stat"><div class="k"><span class="sw" style="background:var(--accent)"></span>Probe</div><div class="v" id="sProbe">–</div></div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="group">
+      <div class="label">Palette</div>
+      <div class="seg" id="palettes"></div>
+    </div>
+    <div class="group">
+      <div class="label">Range</div>
+      <div class="seg" style="margin-bottom:8px">
+        <button data-range="auto">Auto</button>
+        <button data-range="manual">Manual</button>
+      </div>
+      <div class="row">
+        <input type="number" id="rMin" step="0.5" aria-label="Range minimum">
+        <span class="fine">to</span>
+        <input type="number" id="rMax" step="0.5" aria-label="Range maximum">
+      </div>
+    </div>
+    <div class="group">
+      <div class="label">View</div>
+      <div class="seg">
+        <button id="tUnits">°C</button>
+        <button id="tSmooth">Smooth</button>
+        <button id="tMirror">Mirror</button>
+        <button id="tRotate">Rotate</button>
+        <button id="tMarkers">Markers</button>
+      </div>
+    </div>
+    <div class="group">
+      <div class="label">Capture</div>
+      <div class="actions">
+        <button class="btn" id="bSnap">Snapshot</button>
+        <button class="btn" id="bRec">Record</button>
+        <button class="btn" id="bCsv" style="grid-column: span 2">Save temperatures (CSV)</button>
+      </div>
+    </div>
+    <p class="fine" id="info">Tap or hover the image to probe a point.</p>
+  </aside>
+</div>
+
+<script>
+(() => {
+  const HEADER = 20;
+
+  // ---- Palettes (Ironbow matches the device screen) ----
+  const PALETTES = {
+    Ironbow: [[0, 0, 0, 10], [.15, 45, 0, 120], [.32, 140, 0, 150], [.5, 215, 40, 70],
+              [.65, 245, 110, 0], [.82, 255, 190, 0], [1, 255, 255, 230]],
+    Rainbow: [[0, 20, 0, 120], [.2, 0, 90, 255], [.4, 0, 220, 220], [.6, 60, 220, 40],
+              [.8, 255, 200, 0], [1, 255, 30, 0]],
+    'White hot': [[0, 0, 0, 0], [1, 255, 255, 255]],
+    'Black hot': [[0, 255, 255, 255], [1, 0, 0, 0]],
+  };
+  const lut = {};
+  for (const [name, stops] of Object.entries(PALETTES)) {
+    const t = new Uint8ClampedArray(256 * 3);
+    for (let i = 0; i < 256; i++) {
+      const p = i / 255;
+      let s = 0;
+      while (s < stops.length - 2 && p > stops[s + 1][0]) s++;
+      const a = stops[s], b = stops[s + 1], f = (p - a[0]) / (b[0] - a[0]);
+      for (let c = 0; c < 3; c++) t[i * 3 + c] = a[c + 1] + (b[c + 1] - a[c + 1]) * f;
+    }
+    lut[name] = t;
+  }
+
+  // ---- Settings (per-viewer, best effort) ----
+  const defaults = { palette: 'Ironbow', range: 'auto', rMin: 20, rMax: 40, fahrenheit: false,
+                     smooth: true, mirror: false, rotate: 0, markers: true };
+  let S = { ...defaults };
+  try { S = { ...defaults, ...JSON.parse(localStorage.getItem('m5thermal') || '{}') }; } catch {}
+  const save = () => { try { localStorage.setItem('m5thermal', JSON.stringify(S)); } catch {} };
+
+  // ---- DOM ----
+  const $ = id => document.getElementById(id);
+  const view = $('view'), ctx = view.getContext('2d');
+  const bar = $('bar'), barCtx = bar.getContext('2d');
+  const work = document.createElement('canvas'), workCtx = work.getContext('2d');
+
+  const unit = () => S.fahrenheit ? '°F' : '°C';
+  const toU = c => S.fahrenheit ? c * 9 / 5 + 32 : c;
+  const fromU = u => S.fahrenheit ? (u - 32) * 5 / 9 : u;
+  const fmt = c => c == null || isNaN(c) ? '–' : toU(c).toFixed(1) + unit();
+
+  // ---- Frame state ----
+  let frame = null;          // { w, h, t: Float32Array } in view orientation, °C
+  let lo = NaN, hi = NaN;    // current colour range, °C
+  let probe = null;          // { x, y } in frame coords (0..w, 0..h), or null
+  let lastMsg = 0, frames = 0, fps = 0, fpsT = performance.now();
+  let sensorOk = true;
+
+  // Apply mirror/rotation to the raw W x H grid.
+  function orient(raw, W, H) {
+    const rot = S.rotate, w = rot % 180 ? H : W, h = rot % 180 ? W : H;
+    const t = new Float32Array(W * H);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const sx = S.mirror ? W - 1 - x : x;
+      let dx, dy;
+      if (rot === 0) { dx = sx; dy = y; }
+      else if (rot === 90) { dx = H - 1 - y; dy = sx; }
+      else if (rot === 180) { dx = W - 1 - sx; dy = H - 1 - y; }
+      else { dx = y; dy = W - 1 - sx; }
+      t[dy * w + dx] = raw[y * W + x];
+    }
+    return { w, h, t };
+  }
+
+  // Bilinear sample at continuous coords (pixel centres at i + 0.5).
+  function sample(f, x, y) {
+    const fx = Math.min(Math.max(x - .5, 0), f.w - 1), fy = Math.min(Math.max(y - .5, 0), f.h - 1);
+    const x0 = Math.min(fx | 0, f.w - 2), y0 = Math.min(fy | 0, f.h - 2), wx = fx - x0, wy = fy - y0;
+    const a = f.t[y0 * f.w + x0], b = f.t[y0 * f.w + x0 + 1];
+    const c = f.t[(y0 + 1) * f.w + x0], d = f.t[(y0 + 1) * f.w + x0 + 1];
+    return (a + (b - a) * wx) + ((c + (d - c) * wx) - (a + (b - a) * wx)) * wy;
+  }
+
+  let rawLast = null;
+  function ingest(raw) {
+    rawLast = raw;
+    frame = orient(raw.t, raw.w, raw.h);
+    let mn = Infinity, mx = -Infinity;
+    for (const v of frame.t) { if (v < mn) mn = v; if (v > mx) mx = v; }
+    frame.min = mn; frame.max = mx;
+    if (S.range === 'auto') {
+      // 0.5th-99.5th percentile, so a few outliers don't wash out the image.
+      const sorted = frame.t.slice().sort(), k = Math.floor(sorted.length * .005);
+      const pLo = sorted[k], pHi = sorted[sorted.length - 1 - k];
+      if (isNaN(lo)) { lo = pLo; hi = pHi; } else { lo += (pLo - lo) * .3; hi += (pHi - hi) * .3; }
+    } else { lo = S.rMin; hi = S.rMax; }
+    draw();
+  }
+
+  // ---- Rendering ----
+  function draw() {
+    if (!frame) return;
+    const f = frame;
+    if (work.width !== f.w || work.height !== f.h) { work.width = f.w; work.height = f.h; }
+
+    // Size the visible canvas to its CSS box at device resolution.
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = view.clientWidth, cssH = cssW * f.h / f.w;
+    view.style.height = cssH + 'px';
+    const pw = Math.round(cssW * dpr), ph = Math.round(cssH * dpr);
+    if (view.width !== pw || view.height !== ph) { view.width = pw; view.height = ph; }
+
+    const span = Math.max(hi - lo, S.range === 'auto' ? 2 : .1), L = lut[S.palette];
+    const img = workCtx.createImageData(f.w, f.h), px = img.data;
+    for (let i = 0; i < f.t.length; i++) {
+      const c = Math.max(0, Math.min(255, ((f.t[i] - lo) / span * 255) | 0)) * 3, o = i * 4;
+      px[o] = L[c]; px[o + 1] = L[c + 1]; px[o + 2] = L[c + 2]; px[o + 3] = 255;
+    }
+    workCtx.putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = S.smooth;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(work, 0, 0, pw, ph);
+
+    const sx = pw / f.w, sy = ph / f.h, s = Math.max(1, dpr);
+    let maxI = 0, minI = 0;
+    for (let i = 1; i < f.t.length; i++) { if (f.t[i] > f.t[maxI]) maxI = i; if (f.t[i] < f.t[minI]) minI = i; }
+    const ctr = sample(f, f.w / 2, f.h / 2);
+
+    // Centre crosshair.
+    const cx = pw / 2, cy = ph / 2, r = 10 * s;
+    ctx.lineWidth = 3 * s; ctx.strokeStyle = 'rgba(0,0,0,.6)';
+    cross(cx, cy, r); ctx.lineWidth = 1.5 * s; ctx.strokeStyle = '#fff'; cross(cx, cy, r);
+    label(fmt(ctr), cx + r + 4 * s, cy - r, '#fff', s);
+
+    if (S.markers) {
+      marker((maxI % f.w + .5) * sx, ((maxI / f.w | 0) + .5) * sy, getCss('--hot'), fmt(f.max), s);
+      marker((minI % f.w + .5) * sx, ((minI / f.w | 0) + .5) * sy, getCss('--cold'), fmt(f.min), s);
+    }
+    let pv = null;
+    if (probe) {
+      pv = sample(f, probe.x, probe.y);
+      const px2 = probe.x * sx, py2 = probe.y * sy;
+      ctx.lineWidth = 3 * s; ctx.strokeStyle = 'rgba(0,0,0,.6)'; ring(px2, py2, 7 * s);
+      ctx.lineWidth = 2 * s; ctx.strokeStyle = getCss('--accent'); ring(px2, py2, 7 * s);
+      label(fmt(pv), px2 + 10 * s, py2 + 4 * s, getCss('--accent'), s);
+    }
+
+    $('sMax').textContent = fmt(f.max);
+    $('sMin').textContent = fmt(f.min);
+    $('sCtr').textContent = fmt(ctr);
+    $('sProbe').textContent = probe ? fmt(pv) : '–';
+    $('legendMin').textContent = fmt(lo);
+    $('legendMax').textContent = fmt(lo + span);
+    if (S.range === 'auto') {
+      $('rMin').value = toU(lo).toFixed(1);
+      $('rMax').value = toU(lo + span).toFixed(1);
+    }
+  }
+
+  const cssCache = {};
+  const getCss = n => cssCache[n] || (cssCache[n] = getComputedStyle(document.documentElement).getPropertyValue(n).trim());
+  function cross(x, y, r) {
+    ctx.beginPath(); ctx.moveTo(x - r, y); ctx.lineTo(x - r / 3, y); ctx.moveTo(x + r / 3, y); ctx.lineTo(x + r, y);
+    ctx.moveTo(x, y - r); ctx.lineTo(x, y - r / 3); ctx.moveTo(x, y + r / 3); ctx.lineTo(x, y + r); ctx.stroke();
+  }
+  function ring(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke(); }
+  function marker(x, y, color, text, s) {
+    ctx.beginPath(); ctx.moveTo(x, y - 7 * s); ctx.lineTo(x + 6 * s, y + 4 * s); ctx.lineTo(x - 6 * s, y + 4 * s); ctx.closePath();
+    ctx.fillStyle = color; ctx.fill(); ctx.lineWidth = 1.5 * s; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.stroke();
+    label(text, x + 9 * s, y + 4 * s, color, s);
+  }
+  function label(text, x, y, color, s) {
+    ctx.font = `600 ${13 * s}px system-ui, -apple-system, sans-serif`;
+    const w = ctx.measureText(text).width;
+    if (x + w > view.width - 4 * s) x -= w + 24 * s;   // keep inside the image
+    if (y < 14 * s) y = 14 * s;
+    ctx.lineWidth = 3 * s; ctx.strokeStyle = 'rgba(0,0,0,.75)'; ctx.strokeText(text, x, y);
+    ctx.fillStyle = color; ctx.fillText(text, x, y);
+  }
+
+  function drawBar() {
+    const L = lut[S.palette], img = barCtx.createImageData(256, 1);
+    for (let i = 0; i < 256; i++) { img.data.set([L[i * 3], L[i * 3 + 1], L[i * 3 + 2], 255], i * 4); }
+    barCtx.putImageData(img, 0, 0);
+  }
+
+  // ---- Status ----
+  function setConn(state, text) {
+    $('connDot').className = 'dot' + (state === 'live' ? ' live' : state === 'bad' ? ' bad' : '');
+    $('connText').textContent = text;
+  }
+  function setOverlay(text) {
+    $('overlay').textContent = text || '';
+    $('overlay').classList.toggle('show', !!text);
+  }
+  function setBattery(pct, charging, usb) {
+    const color = pct > 50 ? getCss('--ok') : pct > 20 ? getCss('--warn') : getCss('--hot');
+    const w = Math.round(16 * pct / 100);
+    $('batt').innerHTML =
+      `<svg width="26" height="12" viewBox="0 0 26 12" aria-hidden="true">
+         <rect x="0.5" y="0.5" width="21" height="11" rx="2.5" fill="none" stroke="currentColor"/>
+         <rect x="22.5" y="3.5" width="2.5" height="5" rx="1" fill="currentColor"/>
+         <rect x="2.5" y="2.5" width="${w}" height="7" rx="1" fill="${color}"/>
+         ${charging ? '<path d="M12 1.5 7.5 6.5h3l-1 4 4.5-5h-3z" fill="#fff" stroke="#000" stroke-width=".6"/>' : ''}
+       </svg><span>${pct}%${usb && !charging ? ' · USB' : ''}</span>`;
+    $('batt').title = charging ? 'Charging' : usb ? 'On USB power' : 'On battery';
+  }
+
+  // ---- WebSocket ----
+  let ws, retry = 500;
+  function connect() {
+    setConn('', 'Connecting…');
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { retry = 500; setConn('live', 'Live'); };
+    ws.onclose = () => {
+      setConn('bad', 'Disconnected'); setOverlay('Connection lost — reconnecting…');
+      setTimeout(connect, retry); retry = Math.min(retry * 2, 5000);
+    };
+    ws.onerror = () => ws.close();
+    ws.onmessage = ev => {
+      const dv = new DataView(ev.data);
+      if (dv.byteLength < HEADER || dv.getUint8(0) !== 2) return;
+      const flags = dv.getUint8(1);
+      sensorOk = !!(flags & 1);
+      setBattery(dv.getUint8(2), !!(flags & 2), !!(flags & 4));
+      lastMsg = performance.now();
+      const w = dv.getUint16(8, true), h = dv.getUint16(10, true);
+      const scale = dv.getFloat32(12, true), offset = dv.getFloat32(16, true);
+      if (!sensorOk || !w || dv.byteLength < HEADER + w * h * 2) { setOverlay('Thermal camera starting…'); return; }
+      setOverlay('');
+      // Radiometric Leptons report kelvin directly; others are estimated.
+      $('info').textContent = Math.abs(offset + 273.15) < .01
+        ? 'Tap or hover the image to probe a point.'
+        : 'Tap or hover the image to probe a point. This Lepton isn\'t radiometric, so temperatures are estimates.';
+      const t = new Float32Array(w * h);
+      for (let i = 0; i < w * h; i++) t[i] = dv.getUint16(HEADER + i * 2, true) * scale + offset;
+      frames++;
+      ingest({ w, h, t });
+    };
+  }
+
+  setInterval(() => {
+    const now = performance.now();
+    fps = frames * 1000 / (now - fpsT); frames = 0; fpsT = now;
+    $('fps').textContent = fps.toFixed(1) + ' fps';
+    if (ws && ws.readyState === 1 && now - lastMsg > 3000) setOverlay('No data from camera');
+  }, 1000);
+
+  // ---- Probe (hover / tap / drag) ----
+  function probeAt(e) {
+    if (!frame) return;
+    const r = view.getBoundingClientRect();
+    probe = { x: (e.clientX - r.left) / r.width * frame.w, y: (e.clientY - r.top) / r.height * frame.h };
+    draw();
+  }
+  view.addEventListener('pointermove', e => { if (e.pointerType === 'mouse' || e.buttons) probeAt(e); });
+  view.addEventListener('pointerdown', e => { view.setPointerCapture(e.pointerId); probeAt(e); });
+  view.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') { probe = null; draw(); } });
+
+  // ---- Controls ----
+  const palBox = $('palettes');
+  for (const name of Object.keys(PALETTES)) {
+    const b = document.createElement('button');
+    b.textContent = name; b.dataset.palette = name;
+    b.onclick = () => { S.palette = name; save(); syncUi(); drawBar(); draw(); };
+    palBox.appendChild(b);
+  }
+  document.querySelectorAll('[data-range]').forEach(b => b.onclick = () => {
+    S.range = b.dataset.range;
+    if (S.range === 'manual' && !isNaN(lo)) { S.rMin = +lo.toFixed(1); S.rMax = +hi.toFixed(1); }
+    if (S.range === 'auto') lo = hi = NaN;
+    save(); syncUi(); if (rawLast) ingest(rawLast);
+  });
+  const onRange = () => {
+    const a = fromU(parseFloat($('rMin').value)), b = fromU(parseFloat($('rMax').value));
+    if (isNaN(a) || isNaN(b) || b <= a) return;
+    S.rMin = a; S.rMax = b; save(); if (rawLast) ingest(rawLast);
+  };
+  $('rMin').onchange = onRange; $('rMax').onchange = onRange;
+
+  const toggle = (id, key) => $(id).onclick = () => { S[key] = !S[key]; save(); syncUi(); if (rawLast) ingest(rawLast); };
+  toggle('tSmooth', 'smooth'); toggle('tMirror', 'mirror'); toggle('tMarkers', 'markers');
+  $('tUnits').onclick = () => { S.fahrenheit = !S.fahrenheit; save(); syncUi(); draw(); };
+  $('tRotate').onclick = () => { S.rotate = (S.rotate + 90) % 360; probe = null; save(); syncUi(); if (rawLast) ingest(rawLast); };
+
+  function syncUi() {
+    palBox.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', b.dataset.palette === S.palette));
+    document.querySelectorAll('[data-range]').forEach(b => b.setAttribute('aria-pressed', b.dataset.range === S.range));
+    $('rMin').disabled = $('rMax').disabled = S.range === 'auto';
+    if (S.range === 'manual') { $('rMin').value = toU(S.rMin).toFixed(1); $('rMax').value = toU(S.rMax).toFixed(1); }
+    $('tUnits').textContent = unit();
+    $('tSmooth').setAttribute('aria-pressed', S.smooth);
+    $('tMirror').setAttribute('aria-pressed', S.mirror);
+    $('tMarkers').setAttribute('aria-pressed', S.markers);
+    $('tRotate').setAttribute('aria-pressed', S.rotate !== 0);
+    $('tRotate').textContent = S.rotate ? `Rotate ${S.rotate}°` : 'Rotate';
+  }
+
+  // ---- Capture ----
+  const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  function download(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+  $('bSnap').onclick = () => view.toBlob(b => b && download(b, `thermal-${stamp()}.png`), 'image/png');
+  $('bCsv').onclick = () => {
+    if (!frame) return;
+    const rows = [];
+    for (let y = 0; y < frame.h; y++) rows.push(Array.from(frame.t.slice(y * frame.w, (y + 1) * frame.w), v => toU(v).toFixed(2)).join(','));
+    download(new Blob([`# ${unit()}, ${frame.w}x${frame.h}, ${new Date().toISOString()}\n` + rows.join('\n') + '\n'], { type: 'text/csv' }),
+             `thermal-${stamp()}.csv`);
+  };
+  let rec = null;
+  $('bRec').onclick = () => {
+    if (rec) { rec.stop(); return; }
+    if (!view.captureStream || !window.MediaRecorder) { $('info').textContent = 'Recording is not supported in this browser.'; return; }
+    const type = ['video/webm;codecs=vp9', 'video/webm', 'video/mp4'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+    const chunks = [];
+    rec = new MediaRecorder(view.captureStream(15), type ? { mimeType: type } : {});
+    rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+    rec.onstop = () => {
+      const t = rec.mimeType || type || 'video/webm';
+      download(new Blob(chunks, { type: t }), `thermal-${stamp()}.${t.includes('mp4') ? 'mp4' : 'webm'}`);
+      rec = null; $('bRec').textContent = 'Record'; $('bRec').classList.remove('rec');
+    };
+    rec.start(1000);
+    $('bRec').textContent = 'Stop'; $('bRec').classList.add('rec');
+  };
+
+  window.addEventListener('resize', draw);
+  syncUi(); drawBar(); connect();
+})();
+</script>
+</body>
+</html>

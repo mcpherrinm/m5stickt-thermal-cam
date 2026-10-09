@@ -1,0 +1,68 @@
+# M5 Thermal
+
+Firmware for the M5Stack **M5StickT**: an M5StickC (ESP32-PICO-D4) with a 240×135 ST7789
+screen and a FLIR Lepton 3.x thermal camera (160×120). This unit has a Lepton 3.0
+(part 500-0726-01), which is not radiometric, so temperatures are estimates.
+
+- The LCD shows the live thermal image (Ironbow palette, auto-ranged) and a battery icon.
+- The stick runs its own Wi-Fi access point, **M5-Thermal**. Join it and open
+  <http://192.168.4.1/> (or <http://m5-thermal.local/>) for the web viewer: temperature
+  readouts, tap-to-probe, palettes, manual range, °C/°F, mirror/rotate, PNG/video/CSV capture.
+- A long press of the power button turns the stick off, as with the stock firmware.
+
+## Build and flash
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install platformio
+cp secrets.ini.example secrets.ini      # set ap_password (8-63 chars)
+.venv/bin/pio run -t upload             # ~1 min at 115200 baud
+.venv/bin/pio device monitor            # boot log, then frame-rate stats every 10 s
+```
+
+## Layout
+
+- `src/main.cpp`: Lepton capture task (CCI over I²C, VoSPI over SPI), LCD, battery,
+  Wi-Fi AP and WebSocket stream
+- `web/index.html`: viewer page, embedded into the firmware at build time
+
+Kept locally and not committed (see `.gitignore`):
+
+- `stock/`: M5Stack's original StickT Lepton example, building with today's toolchain
+  (only change: two missing `return` statements that newer GCC turns into crashes)
+- `backup/`: full flash dump of the firmware the device shipped with
+
+## Hardware notes
+
+| Part                 | Connection                                  |
+|----------------------|---------------------------------------------|
+| Lepton CCI (control) | I²C 0x2A on the internal bus (G21/G22)      |
+| Lepton VoSPI (video) | SPI: SCK G2, MISO G25, CS G0 (mode 3, 20 MHz) |
+| Lepton VSYNC         | G38 (Lepton GPIO3, enabled over CCI)        |
+| Lepton reset         | G26                                         |
+| Thumbwheel encoder   | I²C 0x30 on the internal bus (unused here)  |
+
+The Lepton won't boot if anything else talks on its I²C bus while it starts up, so the
+firmware holds the bus for the second after the reset pulse.
+
+## WebSocket frame format (`/ws`, binary, little-endian)
+
+| Offset | Type      | Field                                                  |
+|-------:|-----------|--------------------------------------------------------|
+| 0      | u8        | version (2)                                            |
+| 1      | u8        | flags: bit0 sensor ok, bit1 charging, bit2 USB power   |
+| 2      | u8        | battery %                                              |
+| 3      | u8        | reserved                                               |
+| 4      | u16       | battery mV                                             |
+| 6      | u16       | frame sequence                                         |
+| 8      | u16       | width (160, or 0 for a status-only message)            |
+| 10     | u16       | height (120, or 0)                                     |
+| 12     | f32       | scale                                                  |
+| 16     | f32       | offset: °C = raw × scale + offset                      |
+| 20     | u16 × w×h | raw pixels, row-major, top-left first                  |
+
+## Restoring the original firmware
+
+```sh
+.venv/bin/pio pkg exec -p tool-esptoolpy -- esptool.py --port /dev/cu.usbserial-5D52DC9912 \
+  --baud 115200 write_flash 0 backup/m5stickc-flash-full-4MB.bin
+```

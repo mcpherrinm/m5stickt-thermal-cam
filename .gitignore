@@ -1,0 +1,13 @@
+# Build output and tools
+.pio/
+.venv/
+
+# Wi-Fi password (copy secrets.ini.example)
+secrets.ini
+
+# Local only: flash dump of the original firmware, and M5Stack's example
+backup/
+stock/
+
+# Device photos
+*.HEIC
