@@ -355,6 +355,28 @@
     $('batt').title = charging ? 'Charging' : usb ? 'On USB power' : 'On battery';
   }
 
+  // ---- Frame decoding (see README) ----
+  function decodeRaw(dv, w, h) {
+    if (dv.byteLength < HEADER + w * h * 2) return null;
+    const raw = new Uint16Array(w * h);
+    for (let i = 0; i < w * h; i++) raw[i] = dv.getUint16(HEADER + i * 2, true);
+    return raw;
+  }
+  // Zigzag deltas from the left neighbour (or the pixel above at row start);
+  // one byte below 0x80, else two bytes with the top bit set.
+  function decodeDelta(buf, w, h) {
+    const u8 = new Uint8Array(buf), raw = new Uint16Array(w * h);
+    let p = HEADER;
+    for (let i = 0; i < w * h; i++) {
+      if (p >= u8.length) return null;
+      let z = u8[p++];
+      if (z & 0x80) z = ((z & 0x7F) << 8) | u8[p++];
+      const pred = i % w ? raw[i - 1] : i ? raw[i - w] : 0;
+      raw[i] = pred + ((z >>> 1) ^ -(z & 1));
+    }
+    return raw;
+  }
+
   // ---- WebSocket ----
   let ws, retry = 500;
   function connect() {
@@ -369,21 +391,27 @@
     ws.onerror = () => ws.close();
     ws.onmessage = ev => {
       const dv = new DataView(ev.data);
-      if (dv.byteLength < HEADER || dv.getUint8(0) !== 2) return;
+      const version = dv.byteLength >= HEADER ? dv.getUint8(0) : 0;
+      if (version !== 2 && version !== 3) return;
       const flags = dv.getUint8(1);
       sensorOk = !!(flags & 1);
       setBattery(dv.getUint8(2), !!(flags & 2), !!(flags & 4));
       lastMsg = performance.now();
       const w = dv.getUint16(8, true), h = dv.getUint16(10, true);
       const scale = dv.getFloat32(12, true), offset = dv.getFloat32(16, true);
-      if (!sensorOk || !w || dv.byteLength < HEADER + w * h * 2) { setOverlay('Thermal camera starting…'); return; }
+      const raw = !sensorOk || !w ? null : version === 3 ? decodeDelta(ev.data, w, h) : decodeRaw(dv, w, h);
+      if (!raw) {
+        // Status-only messages (no pixels) also arrive while streaming.
+        if (!sensorOk) setOverlay('Thermal camera starting…');
+        return;
+      }
       setOverlay('');
       // Radiometric Leptons report kelvin directly; others are estimated.
       $('info').textContent = Math.abs(offset + 273.15) < .01
         ? 'Tap or hover the image to probe a point.'
         : 'Tap or hover the image to probe a point. This Lepton isn\'t radiometric, so temperatures are estimates.';
       const t = new Float32Array(w * h);
-      for (let i = 0; i < w * h; i++) t[i] = dv.getUint16(HEADER + i * 2, true) * scale + offset;
+      for (let i = 0; i < w * h; i++) t[i] = raw[i] * scale + offset;
       frames++;
       ingest({ w, h, t });
     };

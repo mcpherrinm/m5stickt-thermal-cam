@@ -46,19 +46,30 @@ firmware holds the bus for the second after the reset pulse.
 
 ## WebSocket frame format (`/ws`, binary, little-endian)
 
-| Offset | Type      | Field                                                  |
-|-------:|-----------|--------------------------------------------------------|
-| 0      | u8        | version (2)                                            |
-| 1      | u8        | flags: bit0 sensor ok, bit1 charging, bit2 USB power   |
-| 2      | u8        | battery %                                              |
-| 3      | u8        | reserved                                               |
-| 4      | u16       | battery mV                                             |
-| 6      | u16       | frame sequence                                         |
-| 8      | u16       | width (160, or 0 for a status-only message)            |
-| 10     | u16       | height (120, or 0)                                     |
-| 12     | f32       | scale                                                  |
-| 16     | f32       | offset: °C = raw × scale + offset                      |
-| 20     | u16 × w×h | raw pixels, row-major, top-left first                  |
+| Offset | Type | Field                                                     |
+|-------:|------|-----------------------------------------------------------|
+| 0      | u8   | version: 2 = raw pixels, 3 = delta-encoded pixels         |
+| 1      | u8   | flags: bit0 sensor ok, bit1 charging, bit2 USB power      |
+| 2      | u8   | battery %                                                 |
+| 3      | u8   | reserved                                                  |
+| 4      | u16  | battery mV                                                |
+| 6      | u16  | frame sequence                                            |
+| 8      | u16  | width (160, or 0 for a status-only message)               |
+| 10     | u16  | height (120, or 0)                                        |
+| 12     | f32  | scale                                                     |
+| 16     | f32  | offset: °C = raw × scale + offset                         |
+| 20     | …    | pixels, row-major, top-left first                         |
+
+Version 2 pixels are u16 raw values. Version 3 (normally used) stores each pixel as
+the difference from its left neighbour, or from the pixel above at the start of a
+row (the first pixel is relative to 0). Each difference `d` is zigzag-encoded,
+`z = (d << 1) ^ (d >> 31)`, and written as one byte if `z < 0x80`, otherwise as two
+bytes `0x80 | z >> 8, z & 0xFF`. Thermal images are smooth, so frames are about half
+the size of raw ones, which keeps the ESP32's Wi-Fi stack streaming at full rate.
+
+Viewers share one send buffer. A viewer that stops reading for 3 s (for example a
+backgrounded browser tab) is disconnected so it doesn't stall the others; the web
+page reconnects automatically.
 
 ## Restoring the original firmware
 

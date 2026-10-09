@@ -435,6 +435,10 @@ constexpr int kBarsX = kScaleX + kScaleW + 2;
 
 static uint16_t palette[256];         // RGB565, for drawing primitives
 static uint16_t paletteSwapped[256];  // byte-swapped, for raw pushImage()
+// The panel is drawn in strips through a small sprite: a full-height one
+// costs 19 KB, which the Wi-Fi stack needs to stream frames.
+constexpr int kPanelStripH = 27;
+static_assert(kScreenH % kPanelStripH == 0, "strips must tile the panel");
 static TFT_eSprite panel(&M5.Lcd);
 
 // "Ironbow" palette; keep in sync with the web viewer.
@@ -551,41 +555,49 @@ struct FrameStats {
   uint16_t hist[kHistH];   // row 0 = hottest
 };
 
-static void drawPanel(const FrameStats *st) {
-  panel.fillSprite(TFT_BLACK);
-  drawBatteryIcon(panel, kPanelW - 18, 4);
-  drawCrosshairIcon(panel, 5, 8);
+// Draws the panel shifted up by `oy` rows, so it can be rendered one strip
+// at a time into a small sprite.
+static void drawPanelContent(const FrameStats *st, int oy) {
+  drawBatteryIcon(panel, kPanelW - 18, 4 - oy);
+  drawCrosshairIcon(panel, 5, 8 - oy);
   if (!st) {
     panel.setTextColor(TFT_DARKGREY);
-    panel.drawString("--", 13, 1, 2);
-    panel.pushSprite(kPanelX, 0);
+    panel.drawString("--", 13, 1 - oy, 2);
     return;
   }
 
-  drawTemp(panel, toCelsius(st->centreRaw), 13, 1, 2, TFT_WHITE);
+  drawTemp(panel, toCelsius(st->centreRaw), 13, 1 - oy, 2, TFT_WHITE);
 
-  drawPanelTriangle(panel, 7, kMaxLabelY + 3, true, kHotColor);
-  drawTemp(panel, toCelsius(st->maxRaw), 13, kMaxLabelY, 1, TFT_WHITE);
-  drawPanelTriangle(panel, 7, kMinLabelY + 3, false, kColdColor);
-  drawTemp(panel, toCelsius(st->minRaw), 13, kMinLabelY, 1, TFT_WHITE);
+  drawPanelTriangle(panel, 7, kMaxLabelY + 3 - oy, true, kHotColor);
+  drawTemp(panel, toCelsius(st->maxRaw), 13, kMaxLabelY - oy, 1, TFT_WHITE);
+  drawPanelTriangle(panel, 7, kMinLabelY + 3 - oy, false, kColdColor);
+  drawTemp(panel, toCelsius(st->minRaw), 13, kMinLabelY - oy, 1, TFT_WHITE);
 
   // Colour scale with the histogram beside it, hottest at the top.
   uint16_t peak = 1;
   for (int r = 0; r < kHistH; r++) peak = max(peak, st->hist[r]);
   const int barMax = kPanelW - kBarsX - 1;
   for (int r = 0; r < kHistH; r++) {
+    int y = kHistY + r - oy;
+    if (y < 0 || y >= kPanelStripH) continue;
     uint16_t c = palette[255 - r * 255 / (kHistH - 1)];
-    panel.drawFastHLine(kScaleX, kHistY + r, kScaleW, c);
+    panel.drawFastHLine(kScaleX, y, kScaleW, c);
     int len = (st->hist[r] * barMax + peak - 1) / peak;
-    if (len) panel.drawFastHLine(kBarsX, kHistY + r, len, c);
+    if (len) panel.drawFastHLine(kBarsX, y, len, c);
   }
 
   // Pointer at the centre temperature on the scale.
   float f = (st->hi - st->centreRaw) / (st->hi - st->lo);
-  int py = kHistY + constrain((int)(f * (kHistH - 1)), 0, kHistH - 1);
+  int py = kHistY + constrain((int)(f * (kHistH - 1)), 0, kHistH - 1) - oy;
   panel.fillTriangle(kScaleX - 1, py, kScaleX - 5, py - 3, kScaleX - 5, py + 3, TFT_WHITE);
+}
 
-  panel.pushSprite(kPanelX, 0);
+static void drawPanel(const FrameStats *st) {
+  for (int oy = 0; oy < kScreenH; oy += kPanelStripH) {
+    panel.fillSprite(TFT_BLACK);
+    drawPanelContent(st, oy);
+    panel.pushSprite(kPanelX, oy);
+  }
 }
 
 static void drawFrame(const uint16_t *raw) {
@@ -665,7 +677,7 @@ enum : uint8_t {
 };
 
 struct __attribute__((packed)) FrameHeader {
-  uint8_t version;  // 2
+  uint8_t version;  // 2: raw pixels; 3: delta-encoded pixels
   uint8_t flags;
   uint8_t batteryPct;
   uint8_t reserved;
@@ -688,19 +700,93 @@ static void startNetwork() {
     req->send(200, "text/html", indexHtmlStart, indexHtmlEnd - indexHtmlStart - 1);
   });
   server.onNotFound([](AsyncWebServerRequest *req) { req->redirect("/"); });
+  ws.onEvent([](AsyncWebSocket *, AsyncWebSocketClient *client, AwsEventType type, void *,
+                uint8_t *, size_t) {
+    if (type == WS_EVT_CONNECT) client->setCloseClientOnQueueFull(true);
+  });
   server.addHandler(&ws);
   server.begin();
 }
 
+// Frames go out from one buffer reserved at boot: allocating ~38 KB per frame
+// fails once Wi-Fi clients have fragmented the heap. It's sized for raw
+// pixels; the delta encoding is never larger.
+static AsyncWebSocketSharedBuffer frameMsg;
+constexpr size_t kFrameMsgCapacity = sizeof(FrameHeader) + kFramePixels * 2;
+
+// Delta-encodes pixels against their left neighbour (or the pixel above, at
+// the start of a row). Zigzag-encoded deltas below 128 take one byte; others
+// take two, with the top bit of the first byte set. Thermal images are smooth,
+// so frames shrink to roughly half. Returns 0 if a delta doesn't fit.
+static size_t encodeFrame(const uint16_t *px, uint8_t *out) {
+  uint8_t *o = out;
+  for (int y = 0; y < kFrameH; y++) {
+    for (int x = 0; x < kFrameW; x++) {
+      int i = y * kFrameW + x;
+      int pred = x > 0 ? px[i - 1] : y > 0 ? px[i - kFrameW] : 0;
+      int32_t d = (int32_t)px[i] - pred;
+      uint32_t z = ((uint32_t)d << 1) ^ (uint32_t)(d >> 31);
+      if (z < 0x80) {
+        *o++ = z;
+      } else if (z < 0x8000) {
+        *o++ = 0x80 | (z >> 8);
+        *o++ = z & 0xFF;
+      } else {
+        return 0;
+      }
+    }
+  }
+  return o - out;
+}
+static uint32_t framesSent = 0, framesSkipped = 0, bytesSent = 0;
+static uint32_t frameMsgBusySince = 0;
+
 static void sendFrame(const uint16_t *pixels, uint32_t seq) {
   if (ws.count() == 0) return;
-  // Each frame is ~38 KB; skip it rather than run the heap dry.
-  const size_t len = sizeof(FrameHeader) + (pixels ? kFramePixels * 2 : 0);
-  if (ESP.getMaxAllocHeap() < len + 16384) return;
 
-  auto buf = std::make_shared<std::vector<uint8_t>>(len);
+  AsyncWebSocketSharedBuffer buf;
+  if (pixels) {
+    // Still referenced by a viewer's send queue: that viewer is behind, so
+    // skip this frame rather than overwrite the one being sent.
+    if (frameMsg.use_count() > 1) {
+      framesSkipped++;
+      // A viewer that stops reading (e.g. a backgrounded browser tab) never
+      // finishes, which would stall every viewer since they share frameMsg.
+      // After a while, send a tiny status message: viewers with an empty
+      // queue just get it, and the stuck one has a full queue so the library
+      // closes it (setCloseClientOnQueueFull). Its page reconnects by itself.
+      uint32_t now = millis();
+      if (!frameMsgBusySince) {
+        frameMsgBusySince = now;
+      } else if (now - frameMsgBusySince > 3000) {
+        Serial.println("Web: viewer stalled; closing it");
+        frameMsgBusySince = 0;
+        sendFrame(nullptr, seq);
+      }
+      return;
+    }
+    frameMsgBusySince = 0;
+    buf = frameMsg;
+  } else {
+    buf = std::make_shared<std::vector<uint8_t>>(sizeof(FrameHeader));
+  }
+
   FrameHeader h = {};
   h.version = 2;
+  size_t payload = 0;
+  if (pixels) {
+    buf->resize(kFrameMsgCapacity);  // Within capacity: never reallocates.
+    payload = encodeFrame(pixels, buf->data() + sizeof(h));
+    if (payload) {
+      h.version = 3;
+    } else {
+      memcpy(buf->data() + sizeof(h), pixels, kFramePixels * 2);
+      payload = kFramePixels * 2;
+    }
+    buf->resize(sizeof(h) + payload);
+    framesSent++;
+    bytesSent += buf->size();
+  }
   h.flags = (sensorOk ? kFlagSensorOk : 0) | (battery.charging ? kFlagCharging : 0) |
             (battery.usb ? kFlagUsbPower : 0);
   h.batteryPct = battery.pct;
@@ -711,8 +797,7 @@ static void sendFrame(const uint16_t *pixels, uint32_t seq) {
   h.scale = tempScale;
   h.offset = tempOffset;
   memcpy(buf->data(), &h, sizeof(h));
-  if (pixels) memcpy(buf->data() + sizeof(h), pixels, kFramePixels * 2);
-  // Viewers still sending the previous frame skip this one.
+  // Viewers still sending the previous message skip this one.
   ws.binaryAll(buf);
 }
 
@@ -728,11 +813,12 @@ void setup() {
     for (;;) delay(1000);
   }
   vsyncSem = xSemaphoreCreateBinary();
+  frameMsg = std::make_shared<std::vector<uint8_t>>(kFrameMsgCapacity);
 
   M5.Lcd.setRotation(kScreenRotation);
   M5.Lcd.fillScreen(TFT_BLACK);
   buildPalette();
-  panel.createSprite(kPanelW, kScreenH);
+  panel.createSprite(kPanelW, kPanelStripH);
   readBattery();
   drawNoSensor();
 
@@ -750,6 +836,7 @@ void setup() {
 void loop() {
   static uint32_t lastSeq = 0;
   static uint32_t lastBatteryMs = 0, lastButtonMs = 0, lastCleanupMs = 0, lastStatusMs = 0;
+  static uint32_t lastWebStatsMs = 0;
   static bool shownNoSensor = true;
   uint32_t now = millis();
 
@@ -795,6 +882,16 @@ void loop() {
   if (!sensorOk && now - lastStatusMs >= 1000) {
     lastStatusMs = now;
     sendFrame(nullptr, seq);
+  }
+
+  if (now - lastWebStatsMs >= 10000) {
+    lastWebStatsMs = now;
+    if (ws.count()) {
+      Serial.printf("Web: %u viewers, %u frames sent (avg %u B), %u skipped; heap %u free, %u largest\n",
+                    ws.count(), framesSent, framesSent ? bytesSent / framesSent : 0, framesSkipped,
+                    ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    }
+    framesSent = framesSkipped = bytesSent = 0;
   }
 
   if (now - lastCleanupMs >= 1000) {
