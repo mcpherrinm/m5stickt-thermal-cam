@@ -10,6 +10,7 @@
 #include <M5StickT.h>
 #include <SPI.h>
 #include <esp32/rom/crc.h>
+#include <ping/ping_sock.h>
 
 static_assert(sizeof(WIFI_SSID) > 1, "Set wifi_ssid in secrets.ini");
 static_assert(sizeof(WIFI_SSID) - 1 <= 32, "wifi_ssid must be at most 32 characters");
@@ -994,8 +995,9 @@ static void printStatusLine() {
   Serial.printf(",\"rssi\":%d,\"reason\":", connected ? WiFi.RSSI() : 0);
   if (connected) Serial.print("null");
   else printJson(disconnectText(wifiDisconnectReason));
-  Serial.printf(",\"viewers\":%u,\"frozen\":%s,\"sensor\":%s,\"battery\":%u}\n", (unsigned)ws.count(),
-                frozen ? "true" : "false", sensorOk ? "true" : "false", battery.pct);
+  Serial.printf(",\"viewers\":%u,\"frozen\":%s,\"sensor\":%s,\"battery\":%u,\"uptime\":%lu,\"heap\":%u,\"heapLowest\":%u}\n",
+                (unsigned)ws.count(), frozen ? "true" : "false", sensorOk ? "true" : "false", battery.pct,
+                millis() / 1000, ESP.getFreeHeap(), ESP.getMinFreeHeap());
 }
 
 // Single frame over serial ("snapshot"): one line, "@frame <bytes> <crc32>
@@ -1086,6 +1088,10 @@ static void pollSerial() {
       // Status lines wait until a snapshot line is finished.
       if (!strcmp(line, "status")) wifiChanged = true;
       else if (!strcmp(line, "snapshot")) requestSnapshot();
+      else if (!strcmp(line, "reconnect")) {
+        Serial.println("Wi-Fi: reconnecting (requested)");
+        WiFi.reconnect();
+      }
       len = 0;
     } else if (len < sizeof(line) - 1) {
       line[len++] = c;
@@ -1097,6 +1103,70 @@ static void pollSerial() {
     printStatusLine();
   }
   continueSnapshot();
+}
+
+// ---- Connectivity watchdog --------------------------------------------------
+
+// The ESP32 can end up "connected" while no traffic gets through (seen here:
+// the camera reported its address but didn't answer ARP or ping). Every 30 s,
+// ping the router; if it stops answering for about a minute, reconnect.
+// Armed only once the router has answered, so one that ignores pings can't
+// cause reconnects.
+constexpr uint32_t kGatewayCheckMs = 30000;
+constexpr int kGatewayFailuresBeforeReconnect = 2;
+
+static esp_ping_handle_t pingSession = nullptr;
+static volatile bool pingDone = false;
+static volatile uint32_t pingReplies = 0;
+
+static void onPingEnd(esp_ping_handle_t hdl, void *) {
+  uint32_t replies = 0;
+  esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &replies, sizeof(replies));
+  pingReplies = replies;
+  pingDone = true;  // The session is deleted from loop(), not from here.
+}
+
+static void checkGateway(uint32_t now) {
+  static uint32_t lastCheckMs = 0;
+  static bool armed = false;
+  static int failures = 0;
+
+  if (pingSession && pingDone) {
+    esp_ping_delete_session(pingSession);
+    pingSession = nullptr;
+    if (pingReplies) {
+      if (!armed) Serial.printf("Wi-Fi: watchdog armed (router %s answers)\n", WiFi.gatewayIP().toString().c_str());
+      armed = true;
+      failures = 0;
+    } else if (armed && ++failures >= kGatewayFailuresBeforeReconnect) {
+      Serial.printf("Wi-Fi: router %s not answering (RSSI %d dBm); reconnecting\n",
+                    WiFi.gatewayIP().toString().c_str(), WiFi.RSSI());
+      failures = 0;
+      armed = false;
+      WiFi.reconnect();
+    }
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    failures = 0;
+    return;
+  }
+  if (pingSession || now - lastCheckMs < kGatewayCheckMs) return;
+  lastCheckMs = now;
+
+  IPAddress gw = WiFi.gatewayIP();
+  if (gw == IPAddress(0, 0, 0, 0)) return;
+  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+  IP_ADDR4(&cfg.target_addr, gw[0], gw[1], gw[2], gw[3]);
+  cfg.count = 3;
+  esp_ping_callbacks_t cbs = {};
+  cbs.on_ping_end = onPingEnd;
+  pingDone = false;
+  if (esp_ping_new_session(&cfg, &cbs, &pingSession) == ESP_OK) {
+    esp_ping_start(pingSession);
+  } else {
+    pingSession = nullptr;
+  }
 }
 
 // ---- Main -----------------------------------------------------------------
@@ -1151,6 +1221,7 @@ void loop() {
 
   // The button on top of the case is the StickC's button B: freeze frame.
   pollSerial();
+  checkGateway(now);
 
   // mDNS (m5-thermal.local) only announces reliably if started once we have
   // an address.

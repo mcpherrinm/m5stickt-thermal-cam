@@ -35,11 +35,17 @@ the camera.
 
 Serial commands (115200 baud, newline-terminated):
 
-- `status` → one `@status {json}` line (also printed whenever the Wi-Fi connection changes).
+- `status` → one `@status {json}` line (also printed whenever the Wi-Fi connection changes),
+  including uptime and free memory.
+- `reconnect` → drop and rejoin the Wi-Fi network.
 - `snapshot` → one `@frame <bytes> <crc32 hex> <base64>` line carrying a frame message in the
   WebSocket format below, or `@frame-error <reason>`. It shows what's on screen (the frozen
   frame, if frozen). Web viewers pause while it's sent. Other log output can occasionally
   land inside the line; check the CRC and retry.
+
+Wi-Fi watchdog: the ESP32 can stay "connected" while no traffic gets through. Every 30 s
+the camera pings its router; if that stops answering for about a minute, it logs it and
+reconnects. It arms only after the router has answered once.
 
 ## Layout
 
