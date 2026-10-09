@@ -419,6 +419,31 @@ static void checkPowerButton() {
   xSemaphoreGive(wire1Mutex);
 }
 
+// Thumbwheel: an encoder at I2C 0x30 on the internal bus, read the way the
+// stock firmware does. Returns true if it was turned since the last call;
+// `ok` reports whether the encoder answered.
+constexpr uint8_t kEncoderAddr = 0x30;
+
+static bool encoderTurned(bool &ok) {
+  xSemaphoreTake(wire1Mutex, portMAX_DELAY);
+  bool turned = false;
+  Wire1.beginTransmission(kEncoderAddr);
+  Wire1.write(0x00);  // Rotation since last clear, signed 16-bit.
+  ok = Wire1.endTransmission() == 0 && Wire1.requestFrom(kEncoderAddr, (uint8_t)2) == 2;
+  if (ok) {
+    int16_t steps = (Wire1.read() << 8) | Wire1.read();
+    if (steps != 0) {
+      turned = true;
+      Wire1.beginTransmission(kEncoderAddr);
+      Wire1.write(0x20);  // Clear the count.
+      Wire1.write(0xFF);
+      Wire1.endTransmission();
+    }
+  }
+  xSemaphoreGive(wire1Mutex);
+  return turned;
+}
+
 // ---- Display --------------------------------------------------------------
 
 constexpr uint16_t kHotColor = 0xF8A2;   // red
@@ -668,6 +693,7 @@ extern const uint8_t indexHtmlStart[] asm("_binary_web_index_html_start");
 extern const uint8_t indexHtmlEnd[] asm("_binary_web_index_html_end");
 
 static AsyncWebServer server(80);
+static volatile int wifiDisconnectReason = 0;  // Last reason since losing the connection.
 static AsyncWebSocket ws("/ws");
 
 // Wire format (little-endian), see README.
@@ -711,11 +737,13 @@ static void startNetwork() {
       Serial.printf("Wi-Fi: joined \"%s\" (channel %d, RSSI %d dBm)\n", WIFI_SSID,
                     info.wifi_sta_connected.channel, WiFi.RSSI());
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      wifiDisconnectReason = 0;
       Serial.printf("Wi-Fi: viewer at http://%s/ (or http://m5-thermal.local/)\n",
                     IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
     } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
       // Reason codes: wifi_err_reason_t, e.g. 15 = handshake timeout (wrong
       // password), 201 = network not found. The driver retries by itself.
+      wifiDisconnectReason = info.wifi_sta_disconnected.reason;
       Serial.printf("Wi-Fi: disconnected (reason %d)\n", info.wifi_sta_disconnected.reason);
     }
   });
@@ -837,6 +865,67 @@ static void sendFrame(const uint16_t *pixels, uint32_t seq) {
   ws.binaryAll(buf);
 }
 
+// ---- Network status page (shown when the thumbwheel is turned) ------------
+
+constexpr uint32_t kStatusShowMs = 5000;
+constexpr uint16_t kLabelColor = 0x8C71;  // grey
+
+static const char *disconnectText(int reason) {
+  switch (reason) {
+    case WIFI_REASON_NO_AP_FOUND: return "network not found";
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT: return "wrong password?";
+    case WIFI_REASON_ASSOC_FAIL: return "association failed";
+    case 0: return "joining...";
+    default: return "disconnected";
+  }
+}
+
+// Draws the page; with `full`, clears the screen and draws the labels too.
+// Values are drawn with padding so they update in place without flicker.
+static void drawStatus(bool full) {
+  auto &lcd = M5.Lcd;
+  if (full) {
+    lcd.fillScreen(TFT_BLACK);
+    lcd.setTextDatum(TL_DATUM);
+    lcd.setTextPadding(0);
+    lcd.setTextColor(kLabelColor, TFT_BLACK);
+    lcd.drawString("NETWORK", 8, 6, 1);
+    lcd.drawString("IP ADDRESS", 8, 40, 1);
+    lcd.drawString("SIGNAL", 8, 74, 1);
+    lcd.drawString("VIEWERS", 128, 74, 1);
+    lcd.drawString("m5-thermal.local", 8, 112, 2);
+  }
+
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  char buf[48];
+
+  lcd.setTextPadding(kScreenW - 16);
+  if (connected) {
+    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%s", WIFI_SSID);
+  } else {
+    lcd.setTextColor(TFT_RED, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "Not connected: %s", disconnectText(wifiDisconnectReason));
+  }
+  // Shorten long network names to fit.
+  while (strlen(buf) > 4 && lcd.textWidth(buf, 2) > kScreenW - 16) strcpy(buf + strlen(buf) - 4, "...");
+  lcd.drawString(buf, 8, 16, 2);
+
+  lcd.setTextColor(connected ? TFT_WHITE : kLabelColor, TFT_BLACK);
+  lcd.drawString(connected ? WiFi.localIP().toString().c_str() : "none", 8, 50, 2);
+
+  lcd.setTextPadding(110);
+  if (connected) snprintf(buf, sizeof(buf), "%d dBm", WiFi.RSSI());
+  else snprintf(buf, sizeof(buf), "-");
+  lcd.drawString(buf, 8, 84, 2);
+  snprintf(buf, sizeof(buf), "%u", (unsigned)ws.count());
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.drawString(buf, 128, 84, 2);
+  lcd.setTextPadding(0);
+}
+
 // ---- Main -----------------------------------------------------------------
 
 void setup() {
@@ -872,7 +961,9 @@ void setup() {
 void loop() {
   static uint32_t lastSeq = 0;
   static uint32_t lastBatteryMs = 0, lastButtonMs = 0, lastCleanupMs = 0, lastStatusMs = 0;
-  static uint32_t lastWebStatsMs = 0;
+  static uint32_t lastWebStatsMs = 0, lastEncoderMs = 0, statusShownMs = 0, lastStatusDrawMs = 0;
+  static bool showingStatus = false;
+  static uint8_t encoderFailures = 0;
   static bool shownNoSensor = true;
   uint32_t now = millis();
 
@@ -881,12 +972,36 @@ void loop() {
     checkPowerButton();
   }
 
+  // Thumbwheel: show the network status page. Poll less often if the
+  // encoder isn't answering, so it can't slow the shared I2C bus.
+  if (now - lastEncoderMs >= (encoderFailures >= 3 ? 5000u : 100u)) {
+    lastEncoderMs = now;
+    bool ok;
+    bool turned = encoderTurned(ok);
+    encoderFailures = ok ? 0 : min(encoderFailures + 1, 3);
+    if (turned) {
+      if (!showingStatus) drawStatus(true);
+      showingStatus = true;
+      statusShownMs = lastStatusDrawMs = now;
+    }
+  }
+  if (showingStatus) {
+    if (now - statusShownMs >= kStatusShowMs) {
+      showingStatus = false;
+      M5.Lcd.fillScreen(TFT_BLACK);
+      if (!sensorOk) drawNoSensor();  // Otherwise the next frame redraws everything.
+    } else if (now - lastStatusDrawMs >= 500) {
+      lastStatusDrawMs = now;
+      drawStatus(false);
+    }
+  }
+
   if (now - lastBatteryMs >= 2000) {
     lastBatteryMs = now;
     Battery prev = battery;
     readBattery();
     // With frames arriving the panel redraws anyway; otherwise refresh it here.
-    if (!sensorOk && (prev.pct != battery.pct || prev.charging != battery.charging)) {
+    if (!sensorOk && !showingStatus && (prev.pct != battery.pct || prev.charging != battery.charging)) {
       drawPanel(nullptr);
     }
   }
@@ -904,12 +1019,12 @@ void loop() {
   if (frame) {
     lastSeq = seq;
     shownNoSensor = false;
-    drawFrame(frame);
+    if (!showingStatus) drawFrame(frame);
     sendFrame(frame, seq);
     portENTER_CRITICAL(&frameMux);
     readyInUse = false;
     portEXIT_CRITICAL(&frameMux);
-  } else if (!sensorOk && !shownNoSensor) {
+  } else if (!sensorOk && !shownNoSensor && !showingStatus) {
     shownNoSensor = true;
     drawNoSensor();
   }
