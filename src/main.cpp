@@ -1,18 +1,18 @@
 // M5StickT thermal camera (M5StickC + FLIR Lepton 3.x, 160x120).
 // Shows the live image and battery level on the LCD, and serves a web viewer
-// over its own Wi-Fi access point (AP_SSID / AP_PASSWORD, set at build time).
+// on the Wi-Fi network configured in secrets.ini (DHCP or a static address).
 
 // The web server headers must come before M5StickT.h, which defines a min()
 // macro that breaks <chrono>.
 #include <WiFi.h>
 #include <ESPmDNS.h>
-#include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <M5StickT.h>
 #include <SPI.h>
 
-static_assert(sizeof(AP_PASSWORD) - 1 >= 8 && sizeof(AP_PASSWORD) - 1 <= 63,
-              "AP_PASSWORD must be 8-63 characters (set it in secrets.ini)");
+static_assert(sizeof(WIFI_SSID) > 1, "Set wifi_ssid in secrets.ini");
+static_assert(sizeof(WIFI_SSID) - 1 <= 32, "wifi_ssid must be at most 32 characters");
+static_assert(sizeof(WIFI_PASSWORD) - 1 <= 63, "wifi_password must be at most 63 characters");
 
 // ---- Hardware (from M5Stack's M5-StickT example) ---------------------------
 
@@ -669,10 +669,6 @@ extern const uint8_t indexHtmlEnd[] asm("_binary_web_index_html_end");
 
 static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
-// Answers every DNS lookup with our address. Phones check for internet access
-// when they join; without DNS that check fails and they switch back to a
-// network that has internet (usually the one at home).
-static DNSServer dns;
 
 // Wire format (little-endian), see README.
 enum : uint8_t {
@@ -694,52 +690,52 @@ struct __attribute__((packed)) FrameHeader {
   float offset;
 };
 
+// Static addressing if STATIC_IP is set in secrets.ini, otherwise DHCP.
+static bool configureAddress() {
+  IPAddress ip, gateway, subnet;
+  if (!ip.fromString(STATIC_IP)) {
+    if (strlen(STATIC_IP)) Serial.printf("Wi-Fi: invalid static_ip \"%s\"; using DHCP\n", STATIC_IP);
+    return false;
+  }
+  if (!gateway.fromString(GATEWAY) || !subnet.fromString(SUBNET)) {
+    Serial.println("Wi-Fi: static_ip needs gateway and subnet; using DHCP");
+    return false;
+  }
+  WiFi.config(ip, gateway, subnet);  // No DNS: the camera never looks up names.
+  return true;
+}
+
 static void startNetwork() {
   WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
-    if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
-      const uint8_t *m = info.wifi_ap_staconnected.mac;
-      Serial.printf("Wi-Fi: %02x:%02x:%02x joined (aid %d)\n", m[3], m[4], m[5], info.wifi_ap_staconnected.aid);
-    } else if (event == ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED) {
-      Serial.printf("Wi-Fi: assigned %s\n", IPAddress(info.wifi_ap_staipassigned.ip.addr).toString().c_str());
-    } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
-      const uint8_t *m = info.wifi_ap_stadisconnected.mac;
-      Serial.printf("Wi-Fi: %02x:%02x:%02x left (aid %d)\n", m[3], m[4], m[5], info.wifi_ap_stadisconnected.aid);
+    if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+      Serial.printf("Wi-Fi: joined \"%s\" (channel %d, RSSI %d dBm)\n", WIFI_SSID,
+                    info.wifi_sta_connected.channel, WiFi.RSSI());
+    } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.printf("Wi-Fi: viewer at http://%s/ (or http://m5-thermal.local/)\n",
+                    IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      // Reason codes: wifi_err_reason_t, e.g. 15 = handshake timeout (wrong
+      // password), 201 = network not found. The driver retries by itself.
+      Serial.printf("Wi-Fi: disconnected (reason %d)\n", info.wifi_sta_disconnected.reason);
     }
   });
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD, 6, 0, 4);
-  Serial.printf("Wi-Fi: channel %d, TX power %d (0.25 dBm units)\n", WiFi.channel(), (int)WiFi.getTxPower());
-  Serial.printf("AP \"%s\" up at http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  WiFi.persistent(false);  // Don't keep credentials in flash; they're built in.
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("m5-thermal");
+  bool isStatic = configureAddress();
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Modem sleep delays incoming packets by up to a beacon interval, which
+  // makes the stream stutter.
+  WiFi.setSleep(false);
+  Serial.printf("Wi-Fi: joining \"%s\" (%s)\n", WIFI_SSID, isStatic ? "static " STATIC_IP : "DHCP");
   if (MDNS.begin("m5-thermal")) MDNS.addService("http", "tcp", 80);
-  dns.setErrorReplyCode(DNSReplyCode::NoError);
-  dns.start(53, "*", WiFi.softAPIP());
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
-    Serial.printf("HTTP: page requested by %s\n", req->client()->remoteIP().toString().c_str());
     // embed_txtfiles appends a NUL terminator; don't send it.
     req->send(200, "text/html", indexHtmlStart, indexHtmlEnd - indexHtmlStart - 1);
   });
-  // Connectivity checks: answer as if the internet were reachable, so phones
-  // stay on this network instead of treating it as broken.
-  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *req) {  // Apple
-    req->send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
-  });
-  server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *req) { req->send(204); });  // Android
-  server.on("/gen_204", HTTP_GET, [](AsyncWebServerRequest *req) { req->send(204); });
-  server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *req) {  // Windows
-    req->send(200, "text/plain", "Microsoft Connect Test");
-  });
-  server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *req) { req->send(200, "text/plain", "Microsoft NCSI"); });
-  // Unknown paths on our own address go to the viewer; other sites' background
-  // requests (all resolved to us) get a cheap 404 rather than the page.
-  server.onNotFound([](AsyncWebServerRequest *req) {
-    const String &host = req->host();
-    if (host == WiFi.softAPIP().toString() || host.startsWith("m5-thermal")) {
-      req->redirect("/");
-    } else {
-      req->send(404);
-    }
-  });
+  server.onNotFound([](AsyncWebServerRequest *req) { req->redirect("/"); });
   ws.onEvent([](AsyncWebSocket *, AsyncWebSocketClient *client, AwsEventType type, void *,
                 uint8_t *, size_t) {
     if (type == WS_EVT_CONNECT) client->setCloseClientOnQueueFull(true);
@@ -879,8 +875,6 @@ void loop() {
   static uint32_t lastWebStatsMs = 0;
   static bool shownNoSensor = true;
   uint32_t now = millis();
-
-  dns.processNextRequest();
 
   if (now - lastButtonMs >= 100) {
     lastButtonMs = now;

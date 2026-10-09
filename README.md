@@ -5,24 +5,25 @@ screen and a FLIR Lepton 3.x thermal camera (160×120). This unit has a Lepton 3
 (part 500-0726-01), which is not radiometric, so temperatures are estimates.
 
 - The LCD shows the live thermal image (Ironbow palette, auto-ranged) and a battery icon.
-- The stick runs its own Wi-Fi access point, **M5-Thermal**. Join it and open
-  <http://192.168.4.1/> (or <http://m5-thermal.local/>) for the web viewer: temperature
-  readouts, tap-to-probe, palettes, manual range, °C/°F, mirror/rotate, PNG/video/CSV capture.
+- The stick joins your Wi-Fi network (set in `secrets.ini`, DHCP or a static address).
+  Open <http://m5-thermal.local/>, or its IP address from the boot log, for the web viewer:
+  a display matching the LCD, tap-to-probe, palettes, manual range, °C/°F, mirror/rotate,
+  fullscreen, and PNG/video/CSV capture.
 - A long press of the power button turns the stick off, as with the stock firmware.
 
 ## Build and flash
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install platformio
-cp secrets.ini.example secrets.ini      # set ap_password (8-63 chars)
+cp secrets.ini.example secrets.ini      # set wifi_ssid, wifi_password (and static_ip)
 .venv/bin/pio run -t upload             # ~1 min at 115200 baud
-.venv/bin/pio device monitor            # boot log, then frame-rate stats every 10 s
+.venv/bin/pio device monitor            # boot log with the IP address, then stats every 10 s
 ```
 
 ## Layout
 
 - `src/main.cpp`: Lepton capture task (CCI over I²C, VoSPI over SPI), LCD, battery,
-  Wi-Fi AP and WebSocket stream
+  Wi-Fi and WebSocket stream
 - `web/index.html`: viewer page, embedded into the firmware at build time
 
 Kept locally and not committed (see `.gitignore`):
