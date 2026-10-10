@@ -429,7 +429,8 @@ constexpr uint8_t kEncoderAddr = 0x30;
 
 struct EncoderState {
   bool ok = false;      // The encoder answered.
-  bool turned = false;  // Rotated since the last read.
+  bool turned = false;  // Rotated since the last read...
+  int steps = 0;        // ...by this much (signed: the direction).
 };
 
 static EncoderState readEncoder() {
@@ -442,6 +443,7 @@ static EncoderState readEncoder() {
     int16_t steps = (Wire1.read() << 8) | Wire1.read();
     if (steps != 0) {
       st.turned = true;
+      st.steps = steps;
       Wire1.beginTransmission(kEncoderAddr);
       Wire1.write(0x20);
       Wire1.write(0xFF);
@@ -942,7 +944,9 @@ static void sendFrame(const uint16_t *pixels, uint32_t seq) {
 
 // ---- Network status page (shown when the thumbwheel is turned) ------------
 
-constexpr uint32_t kStatusShowMs = 5000;
+constexpr uint32_t kStatusShowMs = 15000;
+// Ignore a reverse turn this soon after opening (the wheel can bounce back).
+constexpr uint32_t kStatusReverseGuardMs = 400;
 constexpr uint16_t kLabelColor = 0x8C71;  // grey
 
 static const char *disconnectText(int reason) {
@@ -1261,7 +1265,9 @@ void loop() {
   static uint32_t lastSeq = 0;
   static uint32_t lastBatteryMs = 0, lastButtonMs = 0, lastCleanupMs = 0, lastStatusMs = 0;
   static uint32_t lastWebStatsMs = 0, lastEncoderMs = 0, statusShownMs = 0, lastStatusDrawMs = 0;
-  static bool showingStatus = false;
+  static bool showingStatus = false, closeStatus = false;
+  static int statusDir = 0;  // Direction of the turn that opened the status page.
+  static uint32_t statusOpenedMs = 0;
   static uint8_t encoderFailures = 0;
   static uint32_t lastFrozenSendMs = 0, frozenSeq = 0;
   static bool shownNoSensor = true;
@@ -1296,10 +1302,20 @@ void loop() {
     lastEncoderMs = now;
     EncoderState enc = readEncoder();
     encoderFailures = enc.ok ? 0 : min(encoderFailures + 1, 3);
+    // The first turn opens the status page; turning the same way keeps it
+    // open, and the other way closes it.
     if (enc.turned) {
-      if (!showingStatus) drawStatus(true);
-      showingStatus = true;
-      statusShownMs = lastStatusDrawMs = now;
+      const int dir = enc.steps > 0 ? 1 : -1;
+      if (!showingStatus) {
+        drawStatus(true);
+        showingStatus = true;
+        statusDir = dir;
+        statusOpenedMs = statusShownMs = lastStatusDrawMs = now;
+      } else if (dir == statusDir) {
+        statusShownMs = now;
+      } else if (now - statusOpenedMs >= kStatusReverseGuardMs) {
+        closeStatus = true;
+      }
     }
   }
 
@@ -1319,8 +1335,8 @@ void loop() {
   }
 
   if (showingStatus) {
-    if (now - statusShownMs >= kStatusShowMs) {
-      showingStatus = false;
+    if (closeStatus || now - statusShownMs >= kStatusShowMs) {
+      showingStatus = closeStatus = false;
       M5.Lcd.fillScreen(TFT_BLACK);
       if (!sensorOk) drawNoSensor();
       else if (frozen) drawFrame(readyBuf);
