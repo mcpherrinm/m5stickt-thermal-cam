@@ -554,7 +554,10 @@ static int drawTemp(TFT_eSprite &s, float c, int x, int y, int font, uint16_t co
   return w + 4;
 }
 
-static void drawBatteryIcon(TFT_eSprite &s, int x, int y) {
+// Draws on the LCD or a sprite (a template, so each uses its own drawing
+// functions rather than relying on which are virtual).
+template <typename Canvas>
+static void drawBatteryIcon(Canvas &s, int x, int y) {
   const int w = 15, h = 7;
   uint16_t outline = TFT_LIGHTGREY;
   s.drawRect(x, y, w, h, outline);
@@ -966,7 +969,8 @@ static void drawStatus(bool full) {
     lcd.drawString("NETWORK", 8, 6, 1);
     lcd.drawString("IP ADDRESS", 8, 40, 1);
     lcd.drawString("SIGNAL", 8, 74, 1);
-    lcd.drawString("VIEWERS", 128, 74, 1);
+    lcd.drawString("VIEWERS", 88, 74, 1);
+    lcd.drawString("BATTERY", 156, 74, 1);
     lcd.drawString("m5-thermal.local", 8, 112, 2);
   }
 
@@ -988,13 +992,22 @@ static void drawStatus(bool full) {
   lcd.setTextColor(connected ? TFT_WHITE : kLabelColor, TFT_BLACK);
   lcd.drawString(connected ? WiFi.localIP().toString().c_str() : "none", 8, 50, 2);
 
-  lcd.setTextPadding(110);
+  lcd.setTextPadding(76);
   if (connected) snprintf(buf, sizeof(buf), "%d dBm", WiFi.RSSI());
   else snprintf(buf, sizeof(buf), "-");
   lcd.drawString(buf, 8, 84, 2);
+  lcd.setTextPadding(64);
   snprintf(buf, sizeof(buf), "%u", (unsigned)ws.count());
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.drawString(buf, 128, 84, 2);
+  lcd.drawString(buf, 88, 84, 2);
+
+  // Battery: the same icon as the main screen (with the external-power bolt)
+  // and the percentage.
+  lcd.fillRect(156, 85, 20, 13, TFT_BLACK);
+  drawBatteryIcon(lcd, 157, 89);
+  lcd.setTextPadding(kScreenW - 180);
+  snprintf(buf, sizeof(buf), "%u%%", battery.pct);
+  lcd.drawString(buf, 180, 84, 2);
   lcd.setTextPadding(0);
 }
 
