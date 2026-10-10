@@ -31,7 +31,8 @@ python3 -m venv .venv && .venv/bin/pip install platformio
 Wi-Fi settings live in the camera's flash (NVS), not in the firmware, so they survive
 reflashing. A camera with no settings stays off Wi-Fi and shows "Not configured" on its
 status page. Set them with the finder page below (its **Wi-Fi settings** form opens by
-itself for a camera that isn't set up), or with these serial commands:
+itself for a camera that isn't set up), or with these commands on the
+[serial console](#serial-console):
 
 ```
 wifi-ssid My Network          # the rest of the line is the name (spaces are fine)
@@ -44,18 +45,29 @@ Each replies `@ok <command>` or `@error <command>: <reason>`; the settings take 
 `wifi-apply`. `wifi-forget` erases them. The status line reports the network and addressing
 but never the password. The password is stored unencrypted in flash.
 
-## Finding cameras over USB
+## Serial console
 
-`index.html` (at the repo root, for GitHub Pages) uses WebSerial to find cameras plugged
-into the computer. It reads each camera's network status (network, IP, signal, viewers),
-shows its live log, sets its Wi-Fi, takes single snapshots over USB (no Wi-Fi needed; about 2.5 s each,
-downloadable as PNG or CSV), and links to the camera's viewer. Browsers block embedding the
-camera's plain HTTP page in an HTTPS page, so from GitHub Pages the viewer opens in a new
-tab; served over HTTP (e.g. `python3 -m http.server`, then <http://localhost:8000/>) it's
-embedded too. The page leaves the serial control lines alone, so connecting doesn't restart
-the camera.
+The camera's USB port is a serial console (115200 baud): it prints a log and takes the
+commands below. The finder page uses it for you; to use it by hand, from the repo:
 
-Serial commands (115200 baud, newline-terminated):
+```sh
+.venv/bin/pio device monitor --echo     # quit with Ctrl+C
+```
+
+Type a command and press Enter. `--echo` shows what you type. macOS's built-in `screen`
+works too, without setup (it doesn't echo; quit with Ctrl+A, then K, then Y):
+
+```sh
+screen /dev/cu.usbserial-5D52DC9912 115200
+```
+
+- Only one program can have the port open: disconnect the finder page (or close its tab)
+  first, or you'll get "port busy". `ls /dev/cu.usbserial*` lists the port names.
+- Tools that leave the USB adapter's control lines alone don't restart the camera when they
+  connect. If `status` shows an `uptime` of a few seconds, the tool restarted it.
+- `snapshot` replies with one ~26 KB line of base64; it's meant for the finder page.
+
+Commands (newline-terminated):
 
 - `status` → one `@status {json}` line (also printed whenever the Wi-Fi connection changes),
   including uptime, free memory, and how many times (and when, as uptime) the Wi-Fi
@@ -67,6 +79,17 @@ Serial commands (115200 baud, newline-terminated):
   WebSocket format below, or `@frame-error <reason>`. It shows what's on screen (the frozen
   frame, if frozen). Web viewers pause while it's sent. Other log output can occasionally
   land inside the line; check the CRC and retry.
+
+## Finding cameras over USB
+
+`index.html` (at the repo root, for GitHub Pages) uses WebSerial to find cameras plugged
+into the computer. It reads each camera's network status (network, IP, signal, viewers),
+shows its live log, sets its Wi-Fi, takes single snapshots over USB (no Wi-Fi needed; about 2.5 s each,
+downloadable as PNG or CSV), and links to the camera's viewer. Browsers block embedding the
+camera's plain HTTP page in an HTTPS page, so from GitHub Pages the viewer opens in a new
+tab; served over HTTP (e.g. `python3 -m http.server`, then <http://localhost:8000/>) it's
+embedded too. The page leaves the serial control lines alone, so connecting doesn't restart
+the camera. It talks to the camera with the [serial console](#serial-console) commands.
 
 Wi-Fi watchdog: the ESP32 can stay "connected" while no traffic gets through (its Wi-Fi
 transmit path wedges). Every 10 s, and right away when a web viewer stalls, the camera
