@@ -15,6 +15,9 @@ screen and a FLIR Lepton 3.x thermal camera (160×120). This unit has a Lepton 3
 
 ## Build and flash
 
+Builds with [pioarduino](https://github.com/pioarduino/platform-espressif32) (Arduino core
+3.3 on ESP-IDF 5.5); PlatformIO fetches it from the URL in `platformio.ini`.
+
 ```sh
 python3 -m venv .venv && .venv/bin/pip install platformio
 cp secrets.ini.example secrets.ini      # set wifi_ssid, wifi_password (and static_ip)
@@ -54,6 +57,8 @@ lasts seconds. It arms only after the router has answered once.
 - `src/main.cpp`: Lepton capture task (CCI over I²C, VoSPI over SPI), LCD, battery,
   Wi-Fi and WebSocket stream
 - `web/index.html`: viewer page, embedded into the firmware at build time
+- `lib/M5-StickT/`: M5Stack's StickT library (display, power chip, buttons), vendored with
+  small fixes for Arduino core 3.x
 - `index.html`: WebSerial page for finding cameras and reading their logs
 
 Kept locally and not committed (see `.gitignore`):
@@ -91,12 +96,14 @@ firmware holds the bus for the second after the reset pulse.
 | 16     | f32  | offset: °C = raw × scale + offset                         |
 | 20     | …    | pixels, row-major, top-left first                         |
 
-Version 2 pixels are u16 raw values. Version 3 (normally used) stores each pixel as
+Version 2 pixels are u16 raw values (no longer sent, but the viewer accepts them). Version
+3 stores each pixel as
 the difference from its left neighbour, or from the pixel above at the start of a
 row (the first pixel is relative to 0). Each difference `d` is zigzag-encoded,
 `z = (d << 1) ^ (d >> 31)`, and written as one byte if `z < 0x80`, otherwise as two
 bytes `0x80 | z >> 8, z & 0xFF`. Thermal images are smooth, so frames are about half
-the size of raw ones, which keeps the ESP32's Wi-Fi stack streaming at full rate.
+the size of raw ones (~19 KB), which keeps the ESP32's Wi-Fi stack streaming at full rate.
+The camera reserves 28 KB for a frame; one too detailed to fit is skipped.
 
 Viewers share one send buffer. A viewer that stops reading for 3 s (for example a
 backgrounded browser tab) is disconnected so it doesn't stall the others; the web

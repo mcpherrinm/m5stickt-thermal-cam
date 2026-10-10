@@ -23,10 +23,9 @@ constexpr int kLeptonVsyncPin = 38;
 constexpr int kLeptonResetPin = 26;
 constexpr int kLeptonSckPin = 2;
 constexpr int kLeptonMisoPin = 25;
-// The Lepton has no MOSI, but the SPI driver substitutes GPIO13 (the LCD's
-// clock) if none is given. G34 is input-only, so MOSI goes nowhere; this
-// logs a harmless "GPIO can only be used as input mode" error at boot.
-constexpr int kLeptonMosiPin = 34;
+// The Lepton has no MOSI. (Arduino core 2.x substituted GPIO13, the LCD's
+// clock, for -1; core 3.x leaves it unattached.)
+constexpr int kLeptonMosiPin = -1;
 constexpr uint32_t kLeptonSpiHz = 20000000;
 constexpr uint8_t kLeptonI2cAddr = 0x2A;  // CCI, on Wire1 with the AXP192
 
@@ -774,6 +773,9 @@ static void startNetwork() {
   WiFi.persistent(false);  // Don't keep credentials in flash; they're built in.
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("m5-thermal");
+  // An IPv6 link-local address lets mDNS answer IPv6 lookups for
+  // m5-thermal.local; without one, clients wait 5 s for them to time out.
+  WiFi.enableIPv6();
   bool isStatic = configureAddress();
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -795,24 +797,29 @@ static void startNetwork() {
   server.begin();
 }
 
-// Frames go out from one buffer reserved at boot: allocating ~38 KB per frame
-// fails once Wi-Fi clients have fragmented the heap. It's sized for raw
-// pixels; the delta encoding is never larger.
+// Frames go out from one buffer reserved at boot: allocating one per frame
+// fails once Wi-Fi clients have fragmented the heap. Delta-encoded frames are
+// typically ~19-20 KB; 28 KB leaves room for detailed scenes without the
+// 38 KB raw size, which there isn't memory for on core 3.x. A frame that
+// doesn't fit is skipped.
 static AsyncWebSocketSharedBuffer frameMsg;
-constexpr size_t kFrameMsgCapacity = sizeof(FrameHeader) + kFramePixels * 2;
+constexpr size_t kFrameMsgCapacity = sizeof(FrameHeader) + 28 * 1024;
 
 // Delta-encodes pixels against their left neighbour (or the pixel above, at
 // the start of a row). Zigzag-encoded deltas below 128 take one byte; others
 // take two, with the top bit of the first byte set. Thermal images are smooth,
-// so frames shrink to roughly half. Returns 0 if a delta doesn't fit.
-static size_t encodeFrame(const uint16_t *px, uint8_t *out) {
+// so frames shrink to roughly half. Returns 0 if a delta doesn't fit or the
+// result would exceed `maxLen`.
+static size_t encodeFrame(const uint16_t *px, uint8_t *out, size_t maxLen) {
   uint8_t *o = out;
+  uint8_t *const end = out + maxLen - 1;  // Room for a two-byte delta.
   for (int y = 0; y < kFrameH; y++) {
     for (int x = 0; x < kFrameW; x++) {
       int i = y * kFrameW + x;
       int pred = x > 0 ? px[i - 1] : y > 0 ? px[i - kFrameW] : 0;
       int32_t d = (int32_t)px[i] - pred;
       uint32_t z = ((uint32_t)d << 1) ^ (uint32_t)(d >> 31);
+      if (o >= end) return 0;
       if (z < 0x80) {
         *o++ = z;
       } else if (z < 0x8000) {
@@ -853,16 +860,13 @@ static FrameHeader makeHeader(bool hasPixels, uint32_t seq) {
   return h;
 }
 
-// Header plus pixels, delta-encoded if possible (else raw); returns the size.
+// Header plus delta-encoded pixels, into `out` (kFrameMsgCapacity bytes).
+// Returns the size, or 0 if the frame doesn't fit.
 static size_t buildFrameMessage(const uint16_t *pixels, uint32_t seq, uint8_t *out) {
   FrameHeader h = makeHeader(true, seq);
-  size_t payload = encodeFrame(pixels, out + sizeof(h));
-  if (payload) {
-    h.version = 3;
-  } else {
-    memcpy(out + sizeof(h), pixels, kFramePixels * 2);
-    payload = kFramePixels * 2;
-  }
+  h.version = 3;
+  size_t payload = encodeFrame(pixels, out + sizeof(h), kFrameMsgCapacity - sizeof(h));
+  if (!payload) return 0;
   memcpy(out, &h, sizeof(h));
   return sizeof(h) + payload;
 }
@@ -906,7 +910,12 @@ static void sendFrame(const uint16_t *pixels, uint32_t seq) {
   FrameHeader h = makeHeader(pixels != nullptr, seq);
   if (pixels) {
     buf->resize(kFrameMsgCapacity);  // Within capacity: never reallocates.
-    buf->resize(buildFrameMessage(pixels, seq, buf->data()));
+    size_t n = buildFrameMessage(pixels, seq, buf->data());
+    if (!n) {  // Too detailed to fit; skip this one.
+      framesSkipped++;
+      return;
+    }
+    buf->resize(n);
     framesSent++;
     bytesSent += buf->size();
   } else {
@@ -1054,6 +1063,11 @@ static void startSnapshotIfReady() {
     portENTER_CRITICAL(&frameMux);
     readyInUse = false;
     portEXIT_CRITICAL(&frameMux);
+  }
+  if (!snapLen) {
+    snapMsg.reset();
+    Serial.println("@frame-error frame too detailed to encode");
+    return;
   }
   snapPos = 0;
   serialBusy = true;
