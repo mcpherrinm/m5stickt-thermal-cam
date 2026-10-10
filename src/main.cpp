@@ -563,12 +563,24 @@ static void drawBatteryIcon(TFT_eSprite &s, int x, int y) {
   int fill = (w - 4) * battery.pct / 100;
   if (battery.pct > 0 && fill < 1) fill = 1;
   s.fillRect(x + 2, y + 2, fill, h - 4, color);
-  if (battery.charging) {
-    // Small lightning bolt to the left of the icon.
-    int bx = x - 6;
-    s.drawLine(bx + 3, y - 1, bx + 1, y + 3, TFT_YELLOW);
-    s.drawLine(bx + 1, y + 3, bx + 3, y + 3, TFT_YELLOW);
-    s.drawLine(bx + 3, y + 3, bx + 1, y + 7, TFT_YELLOW);
+  if (battery.usb) {
+    // External power: a bolt over the battery, yellow while charging and
+    // white once full. Outlined in black so it reads over the fill.
+    static const char *const kBolt[] = {"...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..."};
+    const int bx = x + 5;
+    auto lit = [](int c, int r) { return r >= 0 && r < 7 && c >= 0 && c < 5 && kBolt[r][c] == '#'; };
+    for (int r = -1; r <= 7; r++) {
+      for (int c = -1; c <= 5; c++) {
+        if (lit(c, r)) continue;
+        bool edge = false;
+        for (int dr = -1; dr <= 1; dr++) for (int dc = -1; dc <= 1; dc++) edge |= lit(c + dc, r + dr);
+        if (edge) s.drawPixel(bx + c, y + r, TFT_BLACK);
+      }
+    }
+    uint16_t boltColor = battery.charging ? TFT_YELLOW : TFT_WHITE;
+    for (int r = 0; r < 7; r++)
+      for (int c = 0; c < 5; c++)
+        if (lit(c, r)) s.drawPixel(bx + c, y + r, boltColor);
   }
 }
 
