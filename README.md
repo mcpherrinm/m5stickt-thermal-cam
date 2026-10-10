@@ -10,8 +10,8 @@ screen and a FLIR Lepton 3.x thermal camera (160×120). This unit has a Lepton 3
   a display matching the LCD, tap-to-probe, palettes, manual range, °C/°F, mirror/rotate,
   fullscreen, and PNG/video/CSV capture.
 - The button on top freezes the frame (on the LCD and for web viewers); press again to
-  resume. Turning the thumbwheel shows a status page (network, IP address, signal, web
-  viewers and battery); turning it back the other way hides it, or it hides after 15 s.
+  resume. Turning the thumbwheel shows a status page for a few seconds: network, IP
+  address, signal, web viewers and battery.
 - A long press of the power button turns the stick off, as with the stock firmware.
 
 ## Build and flash
