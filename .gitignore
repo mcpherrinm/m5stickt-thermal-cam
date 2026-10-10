@@ -11,4 +11,5 @@ stock/
 
 # Battery discharge log (tools/battery_log.py)
 battery-discharge.csv
+battery-charge.csv
 battery-log.out
