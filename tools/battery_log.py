@@ -4,7 +4,8 @@
 Connects to the camera's WebSocket, reads the header of the first message
 (see README: battery % at offset 2, battery mV at 4, flags at 1), and
 disconnects. Appends a CSV row each minute; stops after the camera has been
-unreachable for 10 minutes in a row. Standard library only.
+unreachable for 20 minutes in a row. Minutes count from the first row in the
+file, so a restarted logger continues the same timeline. Standard library only.
 
     python3 tools/battery_log.py 192.168.0.211 battery-discharge.csv
 """
@@ -12,7 +13,7 @@ import base64, csv, os, socket, struct, sys, time
 from datetime import datetime
 
 HOST, OUT = sys.argv[1], sys.argv[2]
-INTERVAL_S, GIVE_UP_AFTER = 60, 10
+INTERVAL_S, GIVE_UP_AFTER = 60, 20
 
 
 def read_exact(sock, n):
@@ -49,6 +50,11 @@ def read_header():
 
 new = not os.path.exists(OUT) or os.path.getsize(OUT) == 0
 start, failures = time.time(), 0
+if not new:  # Continue the existing timeline.
+    with open(OUT) as f:
+        first = next(csv.DictReader(f), None)
+    if first:
+        start = datetime.fromisoformat(first['time']).timestamp()
 with open(OUT, 'a', newline='') as f:
     w = csv.writer(f)
     if new:
