@@ -70,6 +70,20 @@
   }
   .empty { color: var(--muted); text-align: center; padding: 28px 16px; }
   .snap { margin-top: 14px; }
+  form.wifi { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  form.wifi h3 { font-size: 13px; margin: 0 0 10px; font-weight: 600; }
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 14px; }
+  .fields label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  .fields input[type=text], .fields input[type=password] {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 9px; font: inherit; font-size: 14px; min-width: 0;
+  }
+  .fields input:disabled { opacity: .45; }
+  .checks { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 10px 0; font-size: 13px; }
+  .checks label { display: inline-flex; align-items: center; gap: 6px; }
+  form.wifi .actions { margin-top: 12px; }
+  .msg-ok { color: var(--ok); }
+  .msg-bad { color: var(--hot); }
   .progress { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
   .progress .bar { flex: 1; height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
   .progress .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
@@ -125,10 +139,38 @@
       <a class="btn" data-a="open" target="_blank" rel="noopener" aria-disabled="true">Open viewer</a>
       <button class="btn" data-a="snap" disabled>Take snapshot</button>
       <button class="btn" data-a="logs">Show logs</button>
+      <button class="btn" data-a="wifi" disabled>Wi-Fi settings</button>
       <button class="btn" data-a="conn">Disconnect</button>
       <button class="btn" data-a="forget">Forget</button>
     </div>
     <p class="hint" data-f="hint" hidden></p>
+    <form class="wifi" hidden autocomplete="off">
+      <h3>Wi-Fi settings</h3>
+      <div class="fields">
+        <label>Network name <input type="text" name="ssid" maxlength="32" required spellcheck="false"></label>
+        <label>Password <input type="password" name="password" maxlength="63" autocomplete="new-password"
+               placeholder="Leave blank to keep the current one"></label>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" name="showpw"> Show password</label>
+        <label><input type="checkbox" name="open"> No password (open network)</label>
+      </div>
+      <div class="checks">
+        <label><input type="radio" name="addressing" value="dhcp" checked> DHCP</label>
+        <label><input type="radio" name="addressing" value="static"> Static address</label>
+      </div>
+      <div class="fields" data-f="staticfields">
+        <label>IP address <input type="text" name="ip" inputmode="decimal" spellcheck="false" placeholder="192.168.0.50"></label>
+        <label>Gateway <input type="text" name="gateway" inputmode="decimal" spellcheck="false" placeholder="192.168.0.1"></label>
+        <label>Subnet mask <input type="text" name="subnet" inputmode="decimal" spellcheck="false" value="255.255.255.0"></label>
+      </div>
+      <div class="actions">
+        <button type="submit" class="btn primary">Save &amp; connect</button>
+        <button type="button" class="btn" data-a="wififorget">Forget network</button>
+        <button type="button" class="btn" data-a="wificancel">Cancel</button>
+      </div>
+      <p class="hint" data-f="wifimsg" hidden></p>
+    </form>
     <div class="snap" hidden>
       <div class="progress" hidden><div class="bar"><span></span></div><span data-f="snapmsg"></span></div>
       <div class="snap-body" hidden>
@@ -243,6 +285,14 @@
       this.q('.port').textContent = `USB ${hex(info.usbVendorId)}:${hex(info.usbProductId)}`;
       this.a('logs').onclick = () => this.toggleLogs();
       this.a('snap').onclick = () => this.takeSnapshot();
+      this.a('wifi').onclick = () => this.toggleWifiForm();
+      this.a('wificancel').onclick = () => this.toggleWifiForm(false);
+      this.a('wififorget').onclick = () => this.forgetWifi();
+      const form = this.q('form.wifi');
+      form.onsubmit = e => { e.preventDefault(); this.saveWifi(); };
+      form.elements.showpw.onchange = () => { form.elements.password.type = form.elements.showpw.checked ? 'text' : 'password'; };
+      form.elements.open.onchange = () => this.syncWifiForm();
+      for (const r of form.elements.addressing) r.onchange = () => this.syncWifiForm();
       this.a('png').onclick = () => this.snapshot && this.snapCanvas().toBlob(b => b && saveBlob(b, `thermal-${this.snapshot.stamp}.png`), 'image/png');
       this.a('csv').onclick = () => this.downloadCsv();
       this.a('conn').onclick = () => this.open ? this.disconnect() : this.connect();
@@ -276,6 +326,7 @@
       this.open = true;
       this.a('conn').textContent = 'Disconnect';
       this.a('snap').disabled = false;
+      this.a('wifi').disabled = false;
       // Leave DTR and RTS as opened. On ESP32 boards they drive reset and boot
       // mode, and changing them (one at a time) passes through "reset".
       this.setState('Waiting for camera…', 'warn');
@@ -312,6 +363,7 @@
         if (line.startsWith('@status ')) {
           try { this.onStatus(JSON.parse(line.slice(8))); continue; } catch {}
         }
+        if (line.startsWith('@ok ') || line.startsWith('@error ')) { this.onReply(line); continue; }
         if (line.startsWith('@frame ')) { this.onFrameLine(line); continue; }
         if (line.startsWith('@frame-error ')) {
           this.addLog(`[page] camera: ${line.slice(13)}`);
@@ -321,6 +373,98 @@
         this.addLog(line);
       }
       if (this.snapPending && this.partial.startsWith('@frame ')) this.snapProgress();
+    }
+
+    // ---- Commands with "@ok <cmd>" / "@error <cmd>: <reason>" replies ----
+    command(text, timeoutMs = 4000) {
+      const cmd = text.split(' ')[0];
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { this.pendingReply = null; reject(new Error('no reply from the camera')); }, timeoutMs);
+        this.pendingReply = { cmd, resolve, reject, timer };
+        this.send(text + '\n');
+      });
+    }
+    onReply(line) {
+      const p = this.pendingReply;
+      const ok = line.startsWith('@ok '), rest = line.slice(ok ? 4 : 7);
+      if (!p || !rest.startsWith(p.cmd)) return;
+      clearTimeout(p.timer);
+      this.pendingReply = null;
+      if (ok) p.resolve(); else p.reject(new Error(rest.slice(p.cmd.length).replace(/^:\s*/, '')));
+    }
+
+    // ---- Wi-Fi settings (stored on the camera; see README) ----
+    toggleWifiForm(show = this.q('form.wifi').hidden) {
+      const form = this.q('form.wifi');
+      form.hidden = !show;
+      this.a('wifi').textContent = show ? 'Hide Wi-Fi settings' : 'Wi-Fi settings';
+      if (!show) return;
+      const st = this.status || {}, el = form.elements;
+      el.ssid.value = st.ssid || '';
+      el.password.value = '';
+      el.password.placeholder = st.configured ? 'Leave blank to keep the current one' : '';
+      el.open.checked = false;
+      el.addressing.value = st.addressing === 'static' ? 'static' : 'dhcp';
+      el.ip.value = st.staticIp || '';
+      el.gateway.value = st.gateway || '';
+      el.subnet.value = st.subnet || '255.255.255.0';
+      this.wifiMessage('');
+      this.syncWifiForm();
+      el.ssid.focus();
+    }
+    syncWifiForm() {
+      const el = this.q('form.wifi').elements, isStatic = el.addressing.value === 'static';
+      el.password.disabled = el.open.checked;
+      for (const n of ['ip', 'gateway', 'subnet']) el[n].disabled = !isStatic;
+      this.f('staticfields').style.display = isStatic ? '' : 'none';
+    }
+    wifiMessage(text, kind) {
+      const m = this.f('wifimsg');
+      m.textContent = text;
+      m.hidden = !text;
+      m.className = 'hint' + (kind ? ` msg-${kind}` : '');
+    }
+    async saveWifi() {
+      const el = this.q('form.wifi').elements;
+      const ssid = el.ssid.value, pw = el.password.value, isStatic = el.addressing.value === 'static';
+      const ipOk = v => /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(v) && v.split('.').every(n => +n <= 255);
+      if (!ssid || ssid.length > 32) return this.wifiMessage('Enter a network name (up to 32 characters).', 'bad');
+      if (!el.open.checked && pw && (pw.length < 8 || pw.length > 63)) return this.wifiMessage('Passwords are 8-63 characters.', 'bad');
+      if (!el.open.checked && !pw && !(this.status && this.status.configured)) return this.wifiMessage('Enter the password (or choose an open network).', 'bad');
+      if (isStatic && !(ipOk(el.ip.value) && ipOk(el.gateway.value) && ipOk(el.subnet.value)))
+        return this.wifiMessage('Enter a valid IP address, gateway and subnet mask.', 'bad');
+      const commands = [`wifi-ssid ${ssid}`];
+      if (el.open.checked) commands.push('wifi-password');
+      else if (pw) commands.push(`wifi-password ${pw}`);
+      commands.push(isStatic ? `wifi-ip ${el.ip.value} ${el.gateway.value} ${el.subnet.value}` : 'wifi-ip dhcp');
+      commands.push('wifi-apply');
+      this.wifiMessage('Saving…');
+      try {
+        for (const c of commands) await this.command(c);
+      } catch (e) {
+        return this.wifiMessage(`Not saved: ${e.message}.`, 'bad');
+      }
+      this.addLog(`[page] Wi-Fi settings saved (network "${ssid}", ${isStatic ? `static ${el.ip.value}` : 'DHCP'})`);
+      el.password.value = '';
+      this.wifiMessage('Saved on the camera. Connecting… (the status above updates when it joins)', 'ok');
+    }
+    async forgetWifi() {
+      const btn = this.a('wififorget');
+      if (!btn.dataset.armed) {  // Ask for a second click rather than a dialog.
+        btn.dataset.armed = '1';
+        btn.textContent = 'Click again to forget';
+        setTimeout(() => { delete btn.dataset.armed; btn.textContent = 'Forget network'; }, 3000);
+        return;
+      }
+      delete btn.dataset.armed;
+      btn.textContent = 'Forget network';
+      try {
+        await this.command('wifi-forget');
+        this.addLog('[page] Wi-Fi settings erased');
+        this.wifiMessage('Erased. The camera is off Wi-Fi until you save new settings.', 'ok');
+      } catch (e) {
+        this.wifiMessage(`Not erased: ${e.message}.`, 'bad');
+      }
     }
 
     // ---- Snapshots: "snapshot" -> "@frame <bytes> <crc32> <base64>" ----
@@ -433,9 +577,15 @@
     onStatus(st) {
       this.status = st;
       this.q('h2').textContent = 'M5 Thermal';
-      if (!st.connected) this.setState(`Not on Wi-Fi: ${st.reason || 'disconnected'}`, 'warn');
+      if (st.configured === false) this.setState('Wi-Fi not set up', 'warn');
+      else if (!st.connected) this.setState(`Not on Wi-Fi: ${st.reason || 'disconnected'}`, 'warn');
       else this.setState('Online', 'ok');
-      this.f('ssid').textContent = st.ssid || '–';
+      this.f('ssid').textContent = st.configured === false ? 'Not set up' : st.ssid || '–';
+      // A camera that isn't set up needs Wi-Fi settings first: open the form once.
+      if (st.configured === false && !this.wifiFormShown && this.q('form.wifi').hidden) {
+        this.wifiFormShown = true;
+        this.toggleWifiForm(true);
+      }
       this.f('ip').textContent = st.ip || 'none';
       this.f('rssi').textContent = st.connected ? `${st.rssi} dBm` : '–';
       this.f('viewers').textContent = st.viewers;
@@ -520,7 +670,9 @@
       this.open = false;
       clearInterval(this.timer);
       this.a('snap').disabled = true;
+      this.a('wifi').disabled = true;
       if (this.snapPending) this.snapshotFailed('disconnected', false);
+      if (this.pendingReply) { clearTimeout(this.pendingReply.timer); this.pendingReply.reject(new Error('disconnected')); this.pendingReply = null; }
       this.setState(text);
       this.a('conn').textContent = 'Connect';
     }

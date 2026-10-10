@@ -1,6 +1,6 @@
 // M5StickT thermal camera (M5StickC + FLIR Lepton 3.x, 160x120).
 // Shows the live image and battery level on the LCD, and serves a web viewer
-// on the Wi-Fi network configured in secrets.ini (DHCP or a static address).
+// on a Wi-Fi network configured over USB serial (stored in NVS).
 
 // The web server headers must come before M5StickT.h, which defines a min()
 // macro that breaks <chrono>.
@@ -9,12 +9,10 @@
 #include <ESPAsyncWebServer.h>
 #include <M5StickT.h>
 #include <SPI.h>
+#include <Preferences.h>
 #include <esp32/rom/crc.h>
 #include <ping/ping_sock.h>
 
-static_assert(sizeof(WIFI_SSID) > 1, "Set wifi_ssid in secrets.ini");
-static_assert(sizeof(WIFI_SSID) - 1 <= 32, "wifi_ssid must be at most 32 characters");
-static_assert(sizeof(WIFI_PASSWORD) - 1 <= 63, "wifi_password must be at most 63 characters");
 
 // ---- Hardware (from M5Stack's M5-StickT example) ---------------------------
 
@@ -725,6 +723,74 @@ extern const uint8_t indexHtmlEnd[] asm("_binary_web_index_html_end");
 
 static AsyncWebServer server(80);
 static volatile int wifiDisconnectReason = 0;  // Last reason since losing the connection.
+
+// Wi-Fi settings, kept in NVS (namespace "wifi") and set over serial; see
+// pollSerial(). An empty SSID means not configured: the camera stays off
+// Wi-Fi. `ip` empty means DHCP.
+struct WifiSettings {
+  String ssid, password, ip, gateway, subnet;
+  bool isStatic() const { return ip.length() > 0; }
+};
+static WifiSettings wifiSettings;  // In use (as saved in NVS).
+static WifiSettings wifiPending;   // Being edited over serial until "wifi-apply".
+static char wifiSsid[33] = "";     // Copy of wifiSettings.ssid for the event handler.
+
+static void loadWifiSettings() {
+  Preferences prefs;
+  if (prefs.begin("wifi", true)) {  // Fails if nothing was ever saved.
+    wifiSettings.ssid = prefs.getString("ssid", "");
+    wifiSettings.password = prefs.getString("password", "");
+    wifiSettings.ip = prefs.getString("ip", "");
+    wifiSettings.gateway = prefs.getString("gateway", "");
+    wifiSettings.subnet = prefs.getString("subnet", "");
+    prefs.end();
+  }
+  wifiPending = wifiSettings;
+}
+
+static void saveWifiSettings() {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", wifiSettings.ssid);
+  prefs.putString("password", wifiSettings.password);
+  prefs.putString("ip", wifiSettings.ip);
+  prefs.putString("gateway", wifiSettings.gateway);
+  prefs.putString("subnet", wifiSettings.subnet);
+  prefs.end();
+}
+
+static void eraseWifiSettings() {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.clear();
+  prefs.end();
+}
+
+// (Re)connects with wifiSettings, or stays off Wi-Fi if not configured.
+static void connectWifi() {
+  WiFi.disconnect();
+  snprintf(wifiSsid, sizeof(wifiSsid), "%s", wifiSettings.ssid.c_str());
+  wifiDisconnectReason = 0;
+  if (wifiSettings.isStatic()) {
+    IPAddress ip, gateway, subnet;
+    ip.fromString(wifiSettings.ip);  // Validated when set.
+    gateway.fromString(wifiSettings.gateway);
+    subnet.fromString(wifiSettings.subnet);
+    WiFi.config(ip, gateway, subnet);  // No DNS: the camera never looks up names.
+  } else {
+    WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0), IPAddress((uint32_t)0));  // DHCP
+  }
+  if (!wifiSettings.ssid.length()) {
+    Serial.println("Wi-Fi: not configured; set it over USB serial (see README)");
+    return;
+  }
+  WiFi.begin(wifiSettings.ssid.c_str(), wifiSettings.password.c_str());
+  // Modem sleep delays incoming packets by up to a beacon interval, which
+  // makes the stream stutter.
+  WiFi.setSleep(false);
+  Serial.printf("Wi-Fi: joining \"%s\" (%s%s)\n", wifiSsid, wifiSettings.isStatic() ? "static " : "DHCP",
+                wifiSettings.ip.c_str());
+}
 static volatile bool gotIp = false;  // Set by the Wi-Fi event; mDNS starts from loop().
 static volatile bool wifiChanged = false;  // Print a status line over serial.
 static AsyncWebSocket ws("/ws");
@@ -750,25 +816,10 @@ struct __attribute__((packed)) FrameHeader {
   float offset;
 };
 
-// Static addressing if STATIC_IP is set in secrets.ini, otherwise DHCP.
-static bool configureAddress() {
-  IPAddress ip, gateway, subnet;
-  if (!ip.fromString(STATIC_IP)) {
-    if (strlen(STATIC_IP)) Serial.printf("Wi-Fi: invalid static_ip \"%s\"; using DHCP\n", STATIC_IP);
-    return false;
-  }
-  if (!gateway.fromString(GATEWAY) || !subnet.fromString(SUBNET)) {
-    Serial.println("Wi-Fi: static_ip needs gateway and subnet; using DHCP");
-    return false;
-  }
-  WiFi.config(ip, gateway, subnet);  // No DNS: the camera never looks up names.
-  return true;
-}
-
 static void startNetwork() {
   WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
-      Serial.printf("Wi-Fi: joined \"%s\" (channel %d, RSSI %d dBm)\n", WIFI_SSID,
+      Serial.printf("Wi-Fi: joined \"%s\" (channel %d, RSSI %d dBm)\n", wifiSsid,
                     info.wifi_sta_connected.channel, WiFi.RSSI());
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
       wifiDisconnectReason = 0;
@@ -785,19 +836,15 @@ static void startNetwork() {
       Serial.printf("Wi-Fi: disconnected (reason %d)\n", info.wifi_sta_disconnected.reason);
     }
   });
-  WiFi.persistent(false);  // Don't keep credentials in flash; they're built in.
+  WiFi.persistent(false);  // Our own settings live in NVS; see WifiSettings.
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("m5-thermal");
   // An IPv6 link-local address lets mDNS answer IPv6 lookups for
   // m5-thermal.local; without one, clients wait 5 s for them to time out.
   WiFi.enableIPv6();
-  bool isStatic = configureAddress();
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  // Modem sleep delays incoming packets by up to a beacon interval, which
-  // makes the stream stutter.
-  WiFi.setSleep(false);
-  Serial.printf("Wi-Fi: joining \"%s\" (%s)\n", WIFI_SSID, isStatic ? "static " STATIC_IP : "DHCP");
+  loadWifiSettings();
+  connectWifi();
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
     // embed_txtfiles appends a NUL terminator; don't send it.
@@ -978,9 +1025,12 @@ static void drawStatus(bool full) {
   char buf[48];
 
   lcd.setTextPadding(kScreenW - 16);
-  if (connected) {
+  if (!wifiSettings.ssid.length()) {
+    lcd.setTextColor(TFT_RED, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "Not configured: set over USB");
+  } else if (connected) {
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "%s", WIFI_SSID);
+    snprintf(buf, sizeof(buf), "%s", wifiSettings.ssid.c_str());
   } else {
     lcd.setTextColor(TFT_RED, TFT_BLACK);
     snprintf(buf, sizeof(buf), "Not connected: %s", disconnectText(wifiDisconnectReason));
@@ -1026,15 +1076,26 @@ static void printJson(const char *s) {
 }
 
 static void printStatusLine() {
+  const bool configured = wifiSettings.ssid.length() > 0;
   const bool connected = WiFi.status() == WL_CONNECTED;
-  Serial.print("@status {\"device\":\"m5-thermal\",\"ssid\":");
-  printJson(WIFI_SSID);
+  Serial.printf("@status {\"device\":\"m5-thermal\",\"configured\":%s,\"ssid\":", configured ? "true" : "false");
+  if (configured) printJson(wifiSettings.ssid.c_str());
+  else Serial.print("null");
+  Serial.printf(",\"addressing\":\"%s\"", wifiSettings.isStatic() ? "static" : "dhcp");
+  if (wifiSettings.isStatic()) {
+    Serial.print(",\"staticIp\":");
+    printJson(wifiSettings.ip.c_str());
+    Serial.print(",\"gateway\":");
+    printJson(wifiSettings.gateway.c_str());
+    Serial.print(",\"subnet\":");
+    printJson(wifiSettings.subnet.c_str());
+  }
   Serial.printf(",\"connected\":%s,\"ip\":", connected ? "true" : "false");
   if (connected) printJson(WiFi.localIP().toString().c_str());
   else Serial.print("null");
   Serial.printf(",\"rssi\":%d,\"reason\":", connected ? WiFi.RSSI() : 0);
   if (connected) Serial.print("null");
-  else printJson(disconnectText(wifiDisconnectReason));
+  else printJson(configured ? disconnectText(wifiDisconnectReason) : "not configured");
   Serial.printf(",\"viewers\":%u,\"frozen\":%s,\"sensor\":%s,\"battery\":%u,\"uptime\":%lu,\"heap\":%u,\"heapLowest\":%u,"
                 "\"watchdogReconnects\":%u,\"lastWatchdogReconnect\":%u}\n",
                 (unsigned)ws.count(), frozen ? "true" : "false", sensorOk ? "true" : "false", battery.pct,
@@ -1125,19 +1186,77 @@ static void continueSnapshot() {
   }
 }
 
+// Wi-Fi settings commands. Each edits the pending settings and replies
+// "@ok <command>" or "@error <command>: <reason>"; "wifi-apply" saves them to
+// NVS and reconnects. The password is never printed.
+static bool validIp(const String &s) {
+  IPAddress a;
+  return a.fromString(s) && a != IPAddress((uint32_t)0);
+}
+
+static void wifiCommand(const char *cmd, const String &arg) {
+  auto error = [&](const char *why) { Serial.printf("@error %s: %s\n", cmd, why); };
+  if (!strcmp(cmd, "wifi-ssid")) {
+    if (arg.length() < 1 || arg.length() > 32) return error("network name must be 1-32 characters");
+    wifiPending.ssid = arg;
+  } else if (!strcmp(cmd, "wifi-password")) {
+    // Empty for an open network; WPA2 passwords are 8-63 characters.
+    if (arg.length() && (arg.length() < 8 || arg.length() > 63)) return error("password must be 8-63 characters");
+    wifiPending.password = arg;
+  } else if (!strcmp(cmd, "wifi-ip")) {
+    if (arg == "dhcp") {
+      wifiPending.ip = wifiPending.gateway = wifiPending.subnet = "";
+    } else {
+      // <ip> <gateway> [subnet]
+      int sp1 = arg.indexOf(' '), sp2 = sp1 < 0 ? -1 : arg.indexOf(' ', sp1 + 1);
+      String ip = sp1 < 0 ? arg : arg.substring(0, sp1);
+      String gw = sp1 < 0 ? "" : arg.substring(sp1 + 1, sp2 < 0 ? arg.length() : sp2);
+      String mask = sp2 < 0 ? "255.255.255.0" : arg.substring(sp2 + 1);
+      if (!validIp(ip) || !validIp(gw) || !validIp(mask)) return error("expected dhcp, or <ip> <gateway> [subnet]");
+      wifiPending.ip = ip;
+      wifiPending.gateway = gw;
+      wifiPending.subnet = mask;
+    }
+  } else if (!strcmp(cmd, "wifi-apply")) {
+    if (!wifiPending.ssid.length()) return error("set wifi-ssid first");
+    wifiSettings = wifiPending;
+    saveWifiSettings();
+    Serial.printf("@ok %s\n", cmd);
+    connectWifi();
+    wifiChanged = true;  // Status line follows.
+    return;
+  } else if (!strcmp(cmd, "wifi-forget")) {
+    eraseWifiSettings();
+    wifiSettings = wifiPending = WifiSettings();
+    Serial.printf("@ok %s\n", cmd);
+    connectWifi();  // Disconnects and stays off Wi-Fi.
+    wifiChanged = true;
+    return;
+  } else {
+    return error("unknown command");
+  }
+  Serial.printf("@ok %s\n", cmd);
+}
+
 static void pollSerial() {
-  static char line[32];
+  static char line[160];
   static uint8_t len = 0;
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       line[len] = 0;
+      // "<command> <rest of line>"; the rest may contain spaces.
+      char *space = strchr(line, ' ');
+      String arg = space ? String(space + 1) : String();
+      if (space) *space = 0;
       // Status lines wait until a snapshot line is finished.
       if (!strcmp(line, "status")) wifiChanged = true;
       else if (!strcmp(line, "snapshot")) requestSnapshot();
       else if (!strcmp(line, "reconnect")) {
         Serial.println("Wi-Fi: reconnecting (requested)");
         WiFi.reconnect();
+      } else if (!strncmp(line, "wifi-", 5)) {
+        wifiCommand(line, arg);
       }
       len = 0;
     } else if (len < sizeof(line) - 1) {

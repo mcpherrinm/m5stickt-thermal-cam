@@ -5,7 +5,8 @@ screen and a FLIR Lepton 3.x thermal camera (160×120). This unit has a Lepton 3
 (part 500-0726-01), which is not radiometric, so temperatures are estimates.
 
 - The LCD shows the live thermal image (Ironbow palette, auto-ranged) and a battery icon.
-- The stick joins your Wi-Fi network (set in `secrets.ini`, DHCP or a static address).
+- The stick joins your Wi-Fi network (DHCP or a static address), set over USB and stored
+  on the camera: see [Wi-Fi setup](#wi-fi-setup).
   Open <http://m5-thermal.local/>, or its IP address from the boot log, for the web viewer:
   a display matching the LCD, tap-to-probe, palettes, manual range, °C/°F, mirror/rotate,
   fullscreen, and PNG/video/CSV capture.
@@ -21,16 +22,33 @@ Builds with [pioarduino](https://github.com/pioarduino/platform-espressif32) (Ar
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install platformio
-cp secrets.ini.example secrets.ini      # set wifi_ssid, wifi_password (and static_ip)
 .venv/bin/pio run -t upload             # ~1 min at 115200 baud
 .venv/bin/pio device monitor            # boot log with the IP address, then stats every 10 s
 ```
+
+## Wi-Fi setup
+
+Wi-Fi settings live in the camera's flash (NVS), not in the firmware, so they survive
+reflashing. A camera with no settings stays off Wi-Fi and shows "Not configured" on its
+status page. Set them with the finder page below (its **Wi-Fi settings** form opens by
+itself for a camera that isn't set up), or with these serial commands:
+
+```
+wifi-ssid My Network          # the rest of the line is the name (spaces are fine)
+wifi-password my-password     # 8-63 characters; nothing after it for an open network
+wifi-ip dhcp                  # or: wifi-ip <ip> <gateway> [subnet]
+wifi-apply                    # save and connect
+```
+
+Each replies `@ok <command>` or `@error <command>: <reason>`; the settings take effect on
+`wifi-apply`. `wifi-forget` erases them. The status line reports the network and addressing
+but never the password. The password is stored unencrypted in flash.
 
 ## Finding cameras over USB
 
 `index.html` (at the repo root, for GitHub Pages) uses WebSerial to find cameras plugged
 into the computer. It reads each camera's network status (network, IP, signal, viewers),
-shows its live log, takes single snapshots over USB (no Wi-Fi needed; about 2.5 s each,
+shows its live log, sets its Wi-Fi, takes single snapshots over USB (no Wi-Fi needed; about 2.5 s each,
 downloadable as PNG or CSV), and links to the camera's viewer. Browsers block embedding the
 camera's plain HTTP page in an HTTPS page, so from GitHub Pages the viewer opens in a new
 tab; served over HTTP (e.g. `python3 -m http.server`, then <http://localhost:8000/>) it's
@@ -43,6 +61,8 @@ Serial commands (115200 baud, newline-terminated):
   including uptime, free memory, and how many times (and when, as uptime) the Wi-Fi
   watchdog has reconnected.
 - `reconnect` → drop and rejoin the Wi-Fi network.
+- `wifi-ssid`, `wifi-password`, `wifi-ip`, `wifi-apply`, `wifi-forget` → see
+  [Wi-Fi setup](#wi-fi-setup).
 - `snapshot` → one `@frame <bytes> <crc32 hex> <base64>` line carrying a frame message in the
   WebSocket format below, or `@frame-error <reason>`. It shows what's on screen (the frozen
   frame, if frozen). Web viewers pause while it's sent. Other log output can occasionally
