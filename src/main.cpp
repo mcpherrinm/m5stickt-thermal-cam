@@ -388,11 +388,16 @@ struct Battery {
 static Battery battery;
 
 static uint8_t batteryPercent(float v) {
-  // Rough single-cell LiPo discharge curve.
-  static const float pts[][2] = {{3.30f, 0},  {3.60f, 10}, {3.70f, 25}, {3.75f, 40},
-                                 {3.85f, 60}, {4.00f, 80}, {4.15f, 100}};
+  // Measured on this camera while streaming to a browser (1 h 35 min from
+  // 4.09 V to shutdown at ~3.16 V; see tools/battery_log.py): voltage at each
+  // share of the remaining runtime. Under that load, so it reads a little
+  // high when idle or charging.
+  static const float pts[][2] = {{3.19f, 0},  {3.31f, 5},  {3.39f, 10}, {3.46f, 20},
+                                 {3.50f, 30}, {3.55f, 40}, {3.60f, 50}, {3.68f, 60},
+                                 {3.77f, 70}, {3.88f, 80}, {3.99f, 90}, {4.09f, 100}};
+  constexpr int n = sizeof(pts) / sizeof(pts[0]);
   if (v <= pts[0][0]) return 0;
-  for (int i = 1; i < 7; i++) {
+  for (int i = 1; i < n; i++) {
     if (v <= pts[i][0]) {
       float f = (v - pts[i - 1][0]) / (pts[i][0] - pts[i - 1][0]);
       return pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * f;
