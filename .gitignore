@@ -8,3 +8,7 @@ stock/
 
 # Device photos
 *.HEIC
+
+# Battery discharge log (tools/battery_log.py)
+battery-discharge.csv
+battery-log.out
