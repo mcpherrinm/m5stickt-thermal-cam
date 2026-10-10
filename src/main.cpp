@@ -827,6 +827,11 @@ static size_t encodeFrame(const uint16_t *px, uint8_t *out) {
 }
 static uint32_t framesSent = 0, framesSkipped = 0, bytesSent = 0;
 static uint32_t frameMsgBusySince = 0;
+// A viewer stalled: have the Wi-Fi watchdog check the link now.
+static bool gatewayCheckRequested = false;
+// Watchdog reconnects since boot, and the uptime (s) of the latest; reported
+// in the status line to correlate freezes with what was going on.
+static uint32_t watchdogReconnects = 0, lastWatchdogReconnectS = 0;
 // A serial snapshot borrows frameMsg (holding a reference) while it's sent.
 static AsyncWebSocketSharedBuffer snapMsg;
 static bool snapRequested = false;  // A snapshot is waiting for frameMsg...
@@ -886,6 +891,7 @@ static void sendFrame(const uint16_t *pixels, uint32_t seq) {
         frameMsgBusySince = now;
       } else if (now - frameMsgBusySince > 3000) {
         Serial.println("Web: viewer stalled; closing it");
+        gatewayCheckRequested = true;  // Often the first sign of a wedged link.
         frameMsgBusySince = 0;
         sendFrame(nullptr, seq);
       }
@@ -995,9 +1001,11 @@ static void printStatusLine() {
   Serial.printf(",\"rssi\":%d,\"reason\":", connected ? WiFi.RSSI() : 0);
   if (connected) Serial.print("null");
   else printJson(disconnectText(wifiDisconnectReason));
-  Serial.printf(",\"viewers\":%u,\"frozen\":%s,\"sensor\":%s,\"battery\":%u,\"uptime\":%lu,\"heap\":%u,\"heapLowest\":%u}\n",
+  Serial.printf(",\"viewers\":%u,\"frozen\":%s,\"sensor\":%s,\"battery\":%u,\"uptime\":%lu,\"heap\":%u,\"heapLowest\":%u,"
+                "\"watchdogReconnects\":%u,\"lastWatchdogReconnect\":%u}\n",
                 (unsigned)ws.count(), frozen ? "true" : "false", sensorOk ? "true" : "false", battery.pct,
-                millis() / 1000, ESP.getFreeHeap(), ESP.getMinFreeHeap());
+                millis() / 1000, ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+                (unsigned)watchdogReconnects, (unsigned)lastWatchdogReconnectS);
 }
 
 // Single frame over serial ("snapshot"): one line, "@frame <bytes> <crc32>
@@ -1107,13 +1115,14 @@ static void pollSerial() {
 
 // ---- Connectivity watchdog --------------------------------------------------
 
-// The ESP32 can end up "connected" while no traffic gets through (seen here:
-// the camera reported its address but didn't answer ARP or ping). Every 30 s,
-// ping the router; if it stops answering for about a minute, reconnect.
-// Armed only once the router has answered, so one that ignores pings can't
-// cause reconnects.
-constexpr uint32_t kGatewayCheckMs = 30000;
-constexpr int kGatewayFailuresBeforeReconnect = 2;
+// The ESP32 can end up "connected" while no traffic gets through: seen here,
+// the camera kept its address but didn't answer ARP or ping, and its own
+// pings failed to send, so its Wi-Fi transmit path was wedged. Every 10 s
+// (or right away when a web viewer stalls), ping the router three times; if
+// none get a reply, reconnect. Armed only once the router has answered, so
+// one that ignores pings can't cause reconnects.
+constexpr uint32_t kGatewayCheckMs = 10000;
+constexpr int kGatewayFailuresBeforeReconnect = 1;
 
 static esp_ping_handle_t pingSession = nullptr;
 static volatile bool pingDone = false;
@@ -1143,6 +1152,8 @@ static void checkGateway(uint32_t now) {
                     WiFi.gatewayIP().toString().c_str(), WiFi.RSSI());
       failures = 0;
       armed = false;
+      watchdogReconnects++;
+      lastWatchdogReconnectS = millis() / 1000;
       WiFi.reconnect();
     }
   }
@@ -1151,7 +1162,9 @@ static void checkGateway(uint32_t now) {
     failures = 0;
     return;
   }
-  if (pingSession || now - lastCheckMs < kGatewayCheckMs) return;
+  if (pingSession) return;
+  if (now - lastCheckMs < kGatewayCheckMs && !gatewayCheckRequested) return;
+  gatewayCheckRequested = false;
   lastCheckMs = now;
 
   IPAddress gw = WiFi.gatewayIP();
@@ -1159,6 +1172,7 @@ static void checkGateway(uint32_t now) {
   esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
   IP_ADDR4(&cfg.target_addr, gw[0], gw[1], gw[2], gw[3]);
   cfg.count = 3;
+  cfg.interval_ms = 300;
   esp_ping_callbacks_t cbs = {};
   cbs.on_ping_end = onPingEnd;
   pingDone = false;
